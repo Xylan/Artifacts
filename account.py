@@ -241,6 +241,7 @@ class Account:
 
     def __init__(self, api, map_db=None):
         self.api = api
+        self.map_db = map_db
         self.details: Optional[AccountDetails] = None
         self.bank: Bank = Bank()
         self.pending_items: List[PendingItem] = []
@@ -255,8 +256,11 @@ class Account:
         self.actions = CharacterActions(api, map_db)
 
     def set_map_db(self, map_db) -> None:
-        """Call if map_db (e.g. db.maps) wasn't available yet at construction time."""
-        self.actions.map_db = map_db
+        """Call if map_db (e.g. db.maps) wasn't available yet at construction time.
+        Updates it here and propagates to every character already built."""
+        self.map_db = map_db
+        for character in self.characters.values():
+            character.actions.map_db = map_db
 
     @property
     def rate_limiter(self) -> RateLimiter:
@@ -324,9 +328,7 @@ class Account:
             if name in self.characters:
                 self.characters[name].update_from_dict(raw)
             else:
-                character = Character(raw)
-                character.actions = self.actions.bind(character)
-                self.characters[name] = character
+                self.characters[name] = Character(raw, api=self.api, map_db=self.map_db)
 
     async def sync_rate_limits(self) -> None:
         """Optional: refresh all buckets in one call instead of waiting for

@@ -108,7 +108,7 @@ class Cooldown:
 class Character:
     """Character model that parses raw API dictionary responses directly in __init__."""
 
-    def __init__(self, raw_data: Union[Dict[str, Any], List[Dict[str, Any]]]):
+    def __init__(self, raw_data: Union[Dict[str, Any], List[Dict[str, Any]]], api=None, map_db=None):
         # Unpack if a single-element list like [{'name': 'Xylan', ...}] is passed
         data = raw_data[0] if isinstance(raw_data, list) else raw_data
 
@@ -122,11 +122,11 @@ class Character:
         self.gold: int = data["gold"]
         self.speed: int = data["speed"]
 
-        # Bound CharacterActions proxy -- set by Account.sync_characters() via
-        # CharacterActions.bind(self), so `character.actions.rest()` works.
-        # Declared here (not left absent) so Character.__getattr__ below never
-        # has to recurse looking for "actions" itself.
-        self.actions: Optional[Any] = None
+        # CharacterActions instance, created directly (no separate bind() step)
+        # so `character.actions.rest()` -- and `character.rest()` via
+        # __getattr__ below -- work as soon as the character exists.
+        from CharacterActions import CharacterActions
+        self.actions: CharacterActions = CharacterActions(self, api, map_db)
 
         # Complex / Grouped Sub-Models
         self.skills = Skills(
