@@ -11,7 +11,8 @@ import nest_asyncio
 from client import ArtifactsAPI, InventoryFullError
 from database import GameDatabase
 from account import Account
-from planning import GearList, PlanRunner, held_snapshot
+from roles import ensure_naming_scheme, DEFAULT_ROLES
+from task_runner import TaskEngine
 
 nest_asyncio.apply()
 
@@ -28,33 +29,33 @@ async def main():
             print("No characters found on this account!")
             return account, db, api
 
-        print(f"Loading finished. {account!r}")
-        
-        Xylan = account.get_character("Xylan") or next(iter(account.characters.values()))
-        await Xylan.deposit_all()
-        wishlist = GearList.for_upgrades(Xylan, db)
-        print(wishlist.wants)
-        
-        plan =  wishlist.resolve(db, have=held_snapshot(account))
-        plan.auto_assign(account.characters)
-        print(plan.summary())
-        runner = PlanRunner(account, db, db.tasks)
-        await runner.run(plan)
-        await runner.deposit_all()
-        
-        
-        
-        # for count in range(1000):
-        #     while Xylan.is_inventory_full == False:
-        #         await Xylan.actions.rest()
-        #         try:
-        #             await Xylan.actions.fight(target="chicken")
-        #         except InventoryFullError:
-        #             break
-        #     await Xylan.actions.deposit_all()
-        #     await Xylan.actions.deposit_gold(Xylan.gold)
+        # Requirement #6: enforce the Xylan1..Xylan5 naming scheme (renames
+        # existing characters / creates any missing ones, best-effort).
+        await ensure_naming_scheme(account, api)
 
-        # return account, db, api
+        print(f"Loading finished. {account!r}")
+
+        engine = TaskEngine(account, db, roles=DEFAULT_ROLES)
+
+        # Requirement #4, "Clean Slate": deposit everyone's gold/inventory
+        # into the bank before the scheduler starts handing out work.
+        await engine.initialize()
+
+        # Requirement #3/#4: seed each character's auto-detected gear
+        # upgrades as CRAFT-tier work orders, wired to auto-equip once ready.
+        for character in account.characters.values():
+            engine.request_upgrades_for(character)
+
+        # Requirement #5, keep-in-stock example -- tune/add freely:
+        # engine.add_stock_rule("cooked_chicken", 20)
+
+        # Requirement #5, default-task example -- zero inertia, only used
+        # when nothing else is claimable for that character:
+        # engine.set_default_gather_task("Xylan5", "copper_rocks")
+
+        await engine.run()  # runs indefinitely; verifies + prints the plan tree first
+
+        return account, db, api
 
 
 if __name__ == "__main__":

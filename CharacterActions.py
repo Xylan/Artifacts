@@ -273,6 +273,17 @@ class CharacterActions:
             raise ValueError("No MapStore provided to smart_move!")
 
         target_x, target_y = self._normalize_target(destination)
+
+        # Already there -- skip pathfinding entirely. get_shortest_path()
+        # returns an empty path both when there's genuinely no route AND
+        # when start == goal (A* terminates on the first pop with nothing in
+        # came_from), so without this check "already at the destination"
+        # was being logged and treated identically to "no route exists".
+        current_x = self.character.location.position.x
+        current_y = self.character.location.position.y
+        if current_x == target_x and current_y == target_y:
+            return {}
+
         path = active_db.get_shortest_path(self.character.location, destination)
 
         if not path:

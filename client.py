@@ -318,6 +318,16 @@ class ArtifactsAPI:
         return await self.request("GET", f"/accounts/{account_name}")
 
     # ------------------------------------------------------------------
+    # Character roster management (used by roles.ensure_naming_scheme)
+    # ------------------------------------------------------------------
+
+    async def create_character(self, name: str, skin: str) -> dict:
+        return await self.request("POST", "/characters/create", payload={"name": name, "skin": skin})
+
+    async def get_skins(self, page: int = 1, size: int = 100) -> dict:
+        return await self.request("GET", f"/skins?page={page}&size={size}", return_full=True)
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
