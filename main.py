@@ -30,17 +30,16 @@ async def main():
 
         print(f"Loading finished. {account!r}")
         
-        #Xylan = account.get_character("Xylan") or next(iter(account.characters.values()))
-        # for count in range(1000):
-        #     while Xylan.is_inventory_full == False:
-        #         # Xylan.actions.rest() == account.actions.rest(Xylan)
-        #         # (Xylan.rest() also works, via Character.__getattr__ forwarding to .actions)
-        #         await Xylan.actions.rest()
-        #         try:
-        #             await Xylan.actions.fight(target="chicken")
-        #         except InventoryFullError:
-        #             break
-        #     await Xylan.actions.deposit_all()
+        Xylan = account.get_character("Xylan") or next(iter(account.characters.values()))
+        for count in range(1000):
+            while Xylan.is_inventory_full == False:
+                await Xylan.rest()
+                try:
+                    await Xylan.fight(target="chicken")
+                except InventoryFullError:
+                    break
+            await Xylan.deposit_all()
+            await Xylan.deposit_gold(Xylan.gold)
 
         return account, db, api
 

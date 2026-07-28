@@ -248,13 +248,6 @@ class Account:
         self.active_events: List[Event] = []
         self.characters: Dict[str, Character] = {}
 
-        # Local import avoids a circular top-level import (CharacterActions
-        # imports Character, which doesn't import CharacterActions -- but
-        # keeping the import here makes the intentional layering explicit:
-        # Account is what wires api + map_db into a shared actions instance).
-        from CharacterActions import CharacterActions
-        self.actions = CharacterActions(api, map_db)
-
     def __getstate__(self):
         """Prevents Spyder/pickle from crashing on the non-picklable api client.
         self.actions (CharacterActions) and each Character's own .actions
