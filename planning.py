@@ -60,13 +60,24 @@ class GearList:
 
     @classmethod
     def for_upgrades(cls, character, db: GameDatabase) -> "GearList":
-        """Builds a wishlist automatically: every craftable weapon/armor
-        piece the character's current skill levels allow (and whose other
-        conditions -- level, etc. -- they meet) that scores higher than
-        whatever's currently equipped in that slot. An empty slot scores 0,
-        so any eligible craftable item fills it."""
+        """Builds a wishlist automatically: for each equipment slot, the
+        single best craftable weapon/armor piece the character's current
+        skill levels allow (and whose other conditions -- level, etc. --
+        they meet) that scores higher than whatever's currently equipped
+        in that slot. An empty slot scores 0, so any eligible craftable
+        item fills it.
+
+        Only the highest-scoring candidate per slot is kept -- e.g. a
+        weaponcrafter who can craft both a dagger and a wooden_staff will
+        only get whichever one scores higher queued, since weapon_slot can
+        only hold one item. Previously every item that individually beat
+        the equipped baseline was added, so unrelated weapons (or unrelated
+        pieces of armor for the same slot) ended up queued together even
+        though only one could ever actually be equipped."""
         gear_list = cls()
         craftable = db.items.get_craftable_for_character(character)
+
+        best_by_slot: Dict[str, Item] = {}
 
         for item in craftable:
             if item.type not in ARMOR_WEAPON_TYPES:
@@ -80,8 +91,15 @@ class GearList:
                 continue  # already wearing this exact item
 
             equipped_item = db.items.get_item_obj(equipped_code) if equipped_code else None
-            if item_score(item) > item_score(equipped_item):
-                gear_list.add(item.code)
+            if item_score(item) <= item_score(equipped_item):
+                continue  # doesn't beat what's currently equipped
+
+            current_best = best_by_slot.get(slot_attr)
+            if current_best is None or item_score(item) > item_score(current_best):
+                best_by_slot[slot_attr] = item
+
+        for item in best_by_slot.values():
+            gear_list.add(item.code)
 
         return gear_list
 
