@@ -249,6 +249,41 @@ class TaskEngine:
         self.default_orders[character_name] = order
         return order
 
+    def assign_default_gather_tasks(self) -> None:
+        """Requirement #5/#3: gives every character without an explicit
+        default order (set_default_gather_task not already called for
+        them) a fallback gather task, so nobody sits fully idle when
+        nothing else is claimable. Picks the lowest-level resource for the
+        first skill in the character's role.gather_priority cascade that
+        they currently meet the level requirement for -- e.g. if a
+        character's list is [mining, woodcutting, fishing, alchemy] and
+        they're not yet high enough level for any mining node, we fall
+        through to woodcutting, etc. Safe to call repeatedly; characters
+        that already have a default order (explicit or previously
+        assigned here) are left untouched."""
+        for name, character in self.account.characters.items():
+            if name in self.default_orders:
+                continue
+
+            role = self.roles.get(name)
+            priorities = role.gather_priority if role else GATHER_SKILLS
+
+            chosen_resource = None
+            for skill in priorities:
+                char_level = getattr(character.skills, f"{skill}_level", 0)
+                candidates = self.db.resources.get_by_skill(skill, max_level=char_level)
+                if candidates:
+                    chosen_resource = min(candidates, key=lambda r: r.get("level", 1))
+                    break
+
+            if not chosen_resource:
+                print(f"[TaskEngine] No eligible default gather resource found for '{name}'.")
+                continue
+
+            self.set_default_gather_task(name, chosen_resource["code"])
+            print(f"[TaskEngine] Default gather task for '{name}': '{chosen_resource['code']}' "
+                  f"(skill={chosen_resource.get('skill')}).")
+
     # ------------------------------------------------------------------
     # Eligibility / scoring
     # ------------------------------------------------------------------
@@ -440,13 +475,18 @@ class TaskEngine:
 
     def _craft_batch_size(self, character, item, crafts_needed: int) -> int:
         """Bounds a craft run to however many actions actually fit in the
-        character's inventory. Withdrawing ingredients for the *entire*
-        remaining order (e.g. ore for 100 bars) in one shot is what was
-        blowing past inventory_max_items and failing the withdraw/craft --
-        this sizes the batch off free inventory space instead, using the
-        heavier side of (ingredients consumed, net items gained) per craft
-        so we don't overflow either while ingredients are held mid-craft or
-        after the output lands."""
+        character's inventory AND can actually be supplied by materials on
+        hand. Withdrawing ingredients for the *entire* remaining order
+        (e.g. ore for 100 bars) in one shot is what was blowing past
+        inventory_max_items and failing the withdraw/craft -- this sizes
+        the batch off free inventory space, using the heavier side of
+        (ingredients consumed, net items gained) per craft so we don't
+        overflow either while ingredients are held mid-craft or after the
+        output lands. It also caps by held(ingredient) // needed_per_craft
+        for every ingredient, so we never plan a batch bigger than what's
+        actually available across bank + all inventories combined --
+        without this, a craft call could be issued for a quantity we don't
+        have the materials for and fail outright."""
         if not item.craft or not item.craft.items:
             return crafts_needed
 
@@ -457,7 +497,15 @@ class TaskEngine:
 
         free_space = max(0, character.inventory_max_items - character.inventory_used)
         max_by_space = free_space // net_per_craft
-        return max(1, min(crafts_needed, max_by_space))
+
+        max_by_materials = crafts_needed
+        for ing in item.craft.items:
+            if ing.quantity <= 0:
+                continue
+            available = self.held(ing.code)
+            max_by_materials = min(max_by_materials, available // ing.quantity)
+
+        return max(1, min(crafts_needed, max_by_space, max_by_materials))
 
     async def _run_craft_step(self, character, order: WorkOrder) -> None:
         remaining = order.target_quantity - self.held(order.code)
@@ -488,14 +536,16 @@ class TaskEngine:
 
         await character.actions.craft(order.code, quantity=batch, workshop=order.skill, map_db=self.db.maps)
 
-        if character.is_inventory_full:
+        # Deposit after every crafting batch (not just when the inventory
+        # is completely full or the order finishes) so freshly-crafted
+        # output -- and any leftover ingredients -- lands in the bank
+        # immediately, where other characters/orders relying on it can see
+        # it via held().
+        if not character.is_inventory_empty:
             await character.actions.deposit_all()
             await self.account.sync_bank()
 
         if self.held(order.code) >= order.target_quantity:
-            if not character.is_inventory_empty:
-                await character.actions.deposit_all()
-                await self.account.sync_bank()
             self.complete(order)
             await self._try_deliver_equipment(character, order)
 
@@ -532,6 +582,7 @@ class TaskEngine:
         await self.account.sync_bank()
 
     async def run(self) -> None:
+        self.assign_default_gather_tasks()
         self.refresh_stock_orders()
         self.verify()
         self.print_plan_tree()
