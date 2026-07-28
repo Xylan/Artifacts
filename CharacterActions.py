@@ -150,9 +150,11 @@ class CharacterActions:
     async def deposit_items(
         self,
         items: list[dict],
-        map_db: Optional[MapStore] = None
+        map_db: Optional[MapStore] = None,
+        return_to_origin: bool = True
     ) -> dict:
-        """Deposits items. If not at closest bank, auto-relocates to nearest bank via find_closest and returns after."""
+        """Deposits items. If not at closest bank, auto-relocates to nearest bank via find_closest
+        and (unless return_to_origin=False) returns after."""
         if not items:
             return {}
 
@@ -162,18 +164,19 @@ class CharacterActions:
         if self.is_at_bank(active_db):
             return await self._execute_deposit(items)
 
-        # Case 2: Away from bank — move to closest bank, deposit, then return to starting position
+        # Case 2: Away from bank — move to closest bank, deposit, then optionally return to starting position
         closest_bank = self.get_closest_bank(active_db)
         if not closest_bank:
             print(f"[{self.character.name}] Unable to resolve bank position using find_closest!")
             return {}
 
-        print(f"[{self.character.name}] Not at bank. Moving to nearest bank {closest_bank} to deposit and returning...")
-        async with self.temporary_relocate(destination=closest_bank, map_db=active_db):
+        print(f"[{self.character.name}] Not at bank. Moving to nearest bank {closest_bank} to deposit...")
+        async with self.temporary_relocate(destination=closest_bank, map_db=active_db, return_to_origin=return_to_origin):
             return await self._execute_deposit(items)
 
-    async def deposit_all(self, map_db: Optional[MapStore] = None) -> dict:
-        """Deposits all items currently in inventory (auto-relocates via find_closest and returns if not at bank)."""
+    async def deposit_all(self, map_db: Optional[MapStore] = None, return_to_origin: bool = True) -> dict:
+        """Deposits all items currently in inventory (auto-relocates via find_closest;
+        returns to the starting tile afterward unless return_to_origin=False)."""
         items_to_deposit = [
             {"code": item.code, "quantity": item.quantity}
             for item in self.character.inventory
@@ -185,14 +188,15 @@ class CharacterActions:
             return {}
 
         print(f"[{self.character.name}] Depositing {len(items_to_deposit)} item types into the bank...")
-        return await self.deposit_items(items_to_deposit, map_db=map_db)
+        return await self.deposit_items(items_to_deposit, map_db=map_db, return_to_origin=return_to_origin)
 
     @sync_character_state
     async def _execute_deposit_gold(self, quantity: int) -> dict:
         return await self.api.bank_deposit_gold(self.character, quantity)
 
-    async def deposit_gold(self, quantity: int, map_db: Optional[MapStore] = None) -> dict:
-        """Deposits gold. Auto-relocates to nearest bank and returns after, same as deposit_items."""
+    async def deposit_gold(self, quantity: int, map_db: Optional[MapStore] = None, return_to_origin: bool = True) -> dict:
+        """Deposits gold. Auto-relocates to nearest bank and (unless return_to_origin=False)
+        returns after, same as deposit_items."""
         active_db = map_db or self.map_db
         if self.is_at_bank(active_db):
             return await self._execute_deposit_gold(quantity)
@@ -200,7 +204,7 @@ class CharacterActions:
         if not closest_bank:
             print(f"[{self.character.name}] Unable to resolve bank position using find_closest!")
             return {}
-        async with self.temporary_relocate(destination=closest_bank, map_db=active_db):
+        async with self.temporary_relocate(destination=closest_bank, map_db=active_db, return_to_origin=return_to_origin):
             return await self._execute_deposit_gold(quantity)
 
     @sync_character_state
@@ -330,9 +334,13 @@ class CharacterActions:
     async def temporary_relocate(
         self,
         destination: Union[Position, Location, Tuple[int, int], Tuple[int, int, str], object],
-        map_db: Optional[MapStore] = None
+        map_db: Optional[MapStore] = None,
+        return_to_origin: bool = True
     ) -> AsyncGenerator[None, None]:
-        """Context manager: Remembers starting spot, moves to destination, yields, then returns back."""
+        """Context manager: Remembers starting spot, moves to destination, yields,
+        then returns back -- unless return_to_origin=False, in which case the
+        character is left at the destination (useful when the caller knows
+        something else is about to move them again anyway)."""
         active_db = map_db or self.map_db
         starting_pos = (
             self.character.location.position.x,
@@ -344,8 +352,9 @@ class CharacterActions:
             await self.smart_move(destination=destination, map_db=active_db)
             yield
         finally:
-            print(f"[{self.character.name}] Task complete. Returning to origin {starting_pos}...")
-            await self.smart_move(destination=starting_pos, map_db=active_db)
+            if return_to_origin:
+                print(f"[{self.character.name}] Task complete. Returning to origin {starting_pos}...")
+                await self.smart_move(destination=starting_pos, map_db=active_db)
 
     async def run_and_return(
         self,

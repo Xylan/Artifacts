@@ -1,10 +1,11 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
+from datetime import datetime, timezone
 import time
 import math
 import asyncio
 
-from models import Position, Location, InventoryItem, Task
+from models import Position, Location, InventoryItem, Task, parse_reset
 
 
 @dataclass
@@ -87,13 +88,11 @@ class Cooldown:
     def __init__(self, duration_seconds: float = 0.0):
         self.duration = float(duration_seconds)
         self.end_time = time.time() + self.duration
-        print(duration_seconds)
 
     def start(self, duration: float = None):
         if duration is not None:
             self.duration = float(duration)
         self.end_time = time.time() + self.duration
-        print(duration)
 
     @property
     def remaining(self) -> float:
@@ -102,6 +101,23 @@ class Cooldown:
     @property
     def is_ready(self) -> bool:
         return time.time() >= self.end_time
+
+
+def _remaining_from_expiration(expiration_raw: Any) -> float:
+    """Computes actual remaining cooldown seconds from the API's absolute
+    `cooldown_expiration` timestamp, instead of trusting the `cooldown`
+    duration field as if it just started now. On process restart, `cooldown`
+    reflects the length of whatever cooldown was active when the character
+    data was captured -- it says nothing about how much of it (if any) is
+    still left by the time we actually load it. Comparing the absolute
+    expiration to now gives the true remainder, and falls back to 0 (ready)
+    if there's no expiration or it's already in the past -- this is what
+    avoids waiting out an already-expired cooldown after a restart."""
+    expiration = parse_reset(expiration_raw)
+    if not expiration:
+        return 0.0
+    now = datetime.now(expiration.tzinfo or timezone.utc)
+    return max(0.0, (expiration - now).total_seconds())
 
 
 class Character:
@@ -207,7 +223,10 @@ class Character:
         )
 
         # Tasks & Cooldowns
-        self._cooldown = Cooldown(data.get("cooldown", 0))
+        # Seeded from the absolute cooldown_expiration timestamp rather than
+        # the raw `cooldown` duration field -- see _remaining_from_expiration
+        # for why (otherwise a restart re-waits out cooldowns that already expired).
+        self._cooldown = Cooldown(_remaining_from_expiration(data.get("cooldown_expiration")))
 
         self.task: str = data.get("task", "")
         self.task_type: str = data.get("task_type", "")

@@ -456,9 +456,12 @@ class TaskEngine:
             print(f"[{character.name}] Switching off '{old_order.code}' "
                   f"({'idle' if new_order is None else new_order.code} next).")
             self.release(character, old_order)
-            # Requirement #4: deposit inventory whenever switching tasks.
+            # Requirement #4: deposit inventory whenever switching tasks. No
+            # need to walk back afterward -- we're about to claim a new
+            # order (or go idle) right below, so returning to the
+            # pre-deposit tile would just be an extra trip for nothing.
             if not character.is_inventory_empty:
-                await character.actions.deposit_all()
+                await character.actions.deposit_all(return_to_origin=False)
                 await self.account.sync_bank()
 
         if new_order:
@@ -603,12 +606,18 @@ class TaskEngine:
 
     async def initialize(self) -> None:
         """Requirement #4, 'Clean Slate': every character deposits gold and
-        inventory into the bank before the scheduler starts handing out work."""
-        for character in self.account.characters.values():
+        inventory into the bank before the scheduler starts handing out work.
+        Runs all characters concurrently, and skips the walk back to each
+        character's pre-deposit tile -- the scheduler assigns their first
+        order immediately after this, so returning to origin would just be
+        an extra trip in the wrong direction."""
+        async def _clean_slate(character):
             if not character.is_inventory_empty:
-                await character.actions.deposit_all()
+                await character.actions.deposit_all(return_to_origin=False)
             if character.gold > 0:
-                await character.actions.deposit_gold(character.gold)
+                await character.actions.deposit_gold(character.gold, return_to_origin=False)
+
+        await asyncio.gather(*(_clean_slate(c) for c in self.account.characters.values()))
         await self.account.sync_bank()
 
     async def run(self) -> None:
