@@ -85,25 +85,34 @@ def gather_rank(character_name: str, skill: str, roles: Dict[str, CharacterRole]
 async def ensure_naming_scheme(account, api, names: List[str] = NAME_SCHEME) -> None:
     """Renames/creates characters so account.characters keys match `names`.
     Matches existing characters to wanted names positionally (fine for a
-    small fixed roster). Best-effort: POST rename requires an active
-    membership and 451s otherwise -- logged and skipped rather than aborting
-    the whole run, since the roster still works under its old names."""
+    small fixed roster). POST rename requires an active membership and
+    451s otherwise -- rather than firing each rename and catching that per
+    character, we check account.details.member up front and skip the whole
+    rename loop (logged once) when the account isn't a member, since every
+    attempt would 451 anyway. Character creation for missing names still
+    proceeds regardless of membership."""
     from client import APIError
 
     existing = sorted(account.characters.keys())
     wanted = list(names)
 
-    for old_name, new_name in zip(existing, wanted):
-        if old_name == new_name:
-            continue
-        character = account.characters[old_name]
-        try:
-            print(f"[roles] Renaming '{old_name}' -> '{new_name}'...")
-            await api.rename_character(character, new_name)
-            character.name = new_name
-            account.characters[new_name] = account.characters.pop(old_name)
-        except APIError as e:
-            print(f"[roles] Could not rename '{old_name}' -> '{new_name}' ({e}); keeping original name.")
+    is_member = bool(account.details and account.details.member)
+    if not is_member:
+        needs_rename = any(old != new for old, new in zip(existing, wanted))
+        if needs_rename:
+            print("[roles] Account is not a member; skipping rename attempts (keeping original names).")
+    else:
+        for old_name, new_name in zip(existing, wanted):
+            if old_name == new_name:
+                continue
+            character = account.characters[old_name]
+            try:
+                print(f"[roles] Renaming '{old_name}' -> '{new_name}'...")
+                await api.rename_character(character, new_name)
+                character.name = new_name
+                account.characters[new_name] = account.characters.pop(old_name)
+            except APIError as e:
+                print(f"[roles] Could not rename '{old_name}' -> '{new_name}' ({e}); keeping original name.")
 
     missing = wanted[len(existing):]
     if missing:

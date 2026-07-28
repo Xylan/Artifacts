@@ -327,13 +327,30 @@ class TaskEngine:
             score -= 0.1 * gather_rank(character.name, order.skill, self.roles)
         return score
 
-    def _materials_available(self, order: WorkOrder) -> bool:
-        """Requirement #1: only assign a craft order once every ingredient
-        is currently available (bank + all inventories combined)."""
+    def _available_for_craft(self, character, code: str) -> int:
+        """Amount of `code` `character` can actually draw on for crafting
+        right now: what's already sitting in their own inventory, plus
+        whatever's in the bank (withdrawable by anyone). Deliberately
+        excludes every OTHER character's inventory -- held() counts those
+        too, but this character has no way to pull materials out of a
+        teammate's hands, only out of the bank once that teammate deposits.
+        Using held() here was letting the scheduler assign/size craft work
+        based on ingredients that were still in transit on someone else."""
+        own_inventory = next((i.quantity for i in character.inventory if i.code == code), 0)
+        bank_qty = next((i.quantity for i in self.account.bank.items if i.code == code), 0)
+        return own_inventory + bank_qty
+
+    def _materials_available(self, character, order: WorkOrder) -> bool:
+        """Requirement #1: only assign a craft order to `character` once
+        every ingredient is currently available to THEM specifically --
+        their own inventory plus the bank, not the roster's total holdings."""
         item = self.db.items.get_item_obj(order.code)
         if not item or not item.craft:
             return True
-        return all(self.held(ing.code) >= ing.quantity for ing in item.craft.items)
+        return all(
+            self._available_for_craft(character, ing.code) >= ing.quantity
+            for ing in item.craft.items
+        )
 
     def select_order_for(self, character) -> Optional[WorkOrder]:
         current_id = self._current_order.get(character.name)
@@ -350,7 +367,7 @@ class TaskEngine:
                 continue
             if order.target_quantity <= self.held(order.code):
                 continue  # already satisfied, nothing left to do
-            if order.kind == OrderKind.CRAFT and not self._materials_available(order):
+            if order.kind == OrderKind.CRAFT and not self._materials_available(character, order):
                 continue
             score = self._score(character, order)
             if score > best_score:
@@ -475,18 +492,23 @@ class TaskEngine:
 
     def _craft_batch_size(self, character, item, crafts_needed: int) -> int:
         """Bounds a craft run to however many actions actually fit in the
-        character's inventory AND can actually be supplied by materials on
-        hand. Withdrawing ingredients for the *entire* remaining order
-        (e.g. ore for 100 bars) in one shot is what was blowing past
-        inventory_max_items and failing the withdraw/craft -- this sizes
-        the batch off free inventory space, using the heavier side of
-        (ingredients consumed, net items gained) per craft so we don't
-        overflow either while ingredients are held mid-craft or after the
-        output lands. It also caps by held(ingredient) // needed_per_craft
-        for every ingredient, so we never plan a batch bigger than what's
-        actually available across bank + all inventories combined --
-        without this, a craft call could be issued for a quantity we don't
-        have the materials for and fail outright."""
+        character's inventory AND can actually be supplied by materials
+        THIS character can get their hands on. Withdrawing ingredients for
+        the *entire* remaining order (e.g. ore for 100 bars) in one shot is
+        what was blowing past inventory_max_items and failing the
+        withdraw/craft -- this sizes the batch off free inventory space,
+        using the heavier side of (ingredients consumed, net items gained)
+        per craft so we don't overflow either while ingredients are held
+        mid-craft or after the output lands.
+
+        Materials availability is checked via _available_for_craft (own
+        inventory + bank only) rather than held() (which also counts every
+        other character's inventory) -- a craft can only ever pull from the
+        bank or from what's already in this character's hands, never from a
+        teammate who hasn't deposited yet. Returns 0 (not a forced minimum
+        of 1) if even a single craft's worth isn't actually available, so
+        the caller can skip the craft attempt instead of issuing an action
+        that's guaranteed to fail with a missing-materials error."""
         if not item.craft or not item.craft.items:
             return crafts_needed
 
@@ -502,8 +524,11 @@ class TaskEngine:
         for ing in item.craft.items:
             if ing.quantity <= 0:
                 continue
-            available = self.held(ing.code)
+            available = self._available_for_craft(character, ing.code)
             max_by_materials = min(max_by_materials, available // ing.quantity)
+
+        if max_by_materials <= 0:
+            return 0
 
         return max(1, min(crafts_needed, max_by_space, max_by_materials))
 
@@ -516,9 +541,14 @@ class TaskEngine:
 
         if item and item.craft:
             batch = self._craft_batch_size(character, item, crafts_needed)
+            if batch <= 0:
+                print(f"[{character.name}] Not enough '{order.code}' ingredients on hand "
+                      f"(own inventory + bank) to craft right now; waiting for materials.")
+                await asyncio.sleep(self.poll_interval)
+                return
             if batch < crafts_needed:
                 print(f"[{character.name}] Sizing '{order.code}' craft batch to {batch}/{crafts_needed} "
-                      f"actions to fit available inventory space.")
+                      f"actions to fit available inventory/materials.")
 
             to_withdraw = []
             for ing in item.craft.items:
