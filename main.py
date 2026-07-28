@@ -26,24 +26,25 @@ async def main():
 
         if not account.characters:
             print("No characters found on this account!")
-            return account, db, None
+            return account, db, api
 
-        Xylan = account.get_character("Xylan") or next(iter(account.characters.values()))
         print(f"Loading finished. {account!r}")
+        
+        #Xylan = account.get_character("Xylan") or next(iter(account.characters.values()))
+        # for count in range(1000):
+        #     while Xylan.is_inventory_full == False:
+        #         # Xylan.actions.rest() == account.actions.rest(Xylan)
+        #         # (Xylan.rest() also works, via Character.__getattr__ forwarding to .actions)
+        #         await Xylan.actions.rest()
+        #         try:
+        #             await Xylan.actions.fight(target="chicken")
+        #         except InventoryFullError:
+        #             break
+        #     await Xylan.actions.deposit_all()
 
-        for count in range(1000):
-            while Xylan.is_inventory_full == False:
-                # Xylan.actions.rest() == account.actions.rest(Xylan)
-                # (Xylan.rest() also works, via Character.__getattr__ forwarding to .actions)
-                await Xylan.actions.rest()
-                try:
-                    await Xylan.actions.fight(target="chicken")
-                except InventoryFullError:
-                    break
-            await Xylan.actions.deposit_all()
-
-        return account, db, Xylan
+        return account, db, api
 
 
 if __name__ == "__main__":
-    account, db, Xylan = asyncio.run(main())
+    account, db, api = asyncio.run(main())
+    
