@@ -35,6 +35,17 @@ class CharacterActions:
         self.api = api
         self.map_db = map_db
 
+    def __getstate__(self):
+        """Prevents Spyder/pickle from crashing on the non-picklable api client.
+        self.map_db (a MapStore) already nulls its own api reference via
+        BaseStore.__getstate__, so this only needs to handle our own self.api."""
+        state = self.__dict__.copy()
+        state["api"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
     def _normalize_target(
         self,
         target: Union[Position, Location, Tuple[int, int], Tuple[int, int, str], object]

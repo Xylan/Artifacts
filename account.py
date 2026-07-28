@@ -255,6 +255,17 @@ class Account:
         from CharacterActions import CharacterActions
         self.actions = CharacterActions(api, map_db)
 
+    def __getstate__(self):
+        """Prevents Spyder/pickle from crashing on the non-picklable api client.
+        self.actions (CharacterActions) and each Character's own .actions
+        already null their own api reference via their own __getstate__."""
+        state = self.__dict__.copy()
+        state["api"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
     def set_map_db(self, map_db) -> None:
         """Call if map_db (e.g. db.maps) wasn't available yet at construction time.
         Updates it here and propagates to every character already built."""

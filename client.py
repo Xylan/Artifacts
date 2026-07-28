@@ -57,6 +57,15 @@ class ArtifactsAPI:
         # account/IP, not per character (see account.py: RateLimiter).
         self.rate_limiter = RateLimiter()
 
+    def __getstate__(self):
+        """Prevents Spyder/pickle from crashing on the non-picklable httpx client."""
+        state = self.__dict__.copy()
+        state["client"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
     async def request(self, method: str, endpoint: str, character=None, payload=None, params=None, return_full: bool = False) -> dict:
         """Generic, low-level HTTP request wrapper for Artifacts API.
 

@@ -33,3 +33,15 @@ class GameDatabase():
         monster_count = await self.monsters.sync_from_api(force=force)
         resource_count = await self.resources.sync_from_api(force=force)
         return map_count, item_count, monster_count, resource_count
+
+    def __getstate__(self):
+        """Prevents Spyder/pickle from crashing on the non-picklable api client.
+        Nested stores (self.maps/items/monsters/resources) already null their
+        own api reference via BaseStore.__getstate__, so this only needs to
+        handle GameDatabase's own self.api."""
+        state = self.__dict__.copy()
+        state["api"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
