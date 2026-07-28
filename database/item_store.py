@@ -2,6 +2,7 @@ import json
 import time
 from typing import Dict, List, Optional, Any
 from .base_store import BaseStore
+from models import Item
 
 class ItemStore(BaseStore):
 
@@ -124,3 +125,66 @@ class ItemStore(BaseStore):
         if item and "craft" in item and item["craft"]:
             return item["craft"]
         return None
+
+    # ------------------------------------------------------------------
+    # Typed Item accessors + character-aware queries
+    # ------------------------------------------------------------------
+
+    def get_item_obj(self, code: str) -> Optional[Item]:
+        """Same as get_item(), but returns the typed Item dataclass (models.py)
+        instead of a raw dict."""
+        raw = self.get_item(code)
+        return Item.from_dict(raw) if raw else None
+
+    def get_all_items_obj(self) -> List[Item]:
+        with self._get_connection() as conn:
+            cursor = conn.execute("SELECT raw_data FROM items")
+            return [Item.from_dict(json.loads(row["raw_data"])) for row in cursor.fetchall()]
+
+    def _conditions_met(self, character, conditions) -> bool:
+        """Evaluates a list of ItemCondition against character attributes.
+        Mirrors MapStore.check_conditions -- same idea, scoped to items
+        instead of map tiles."""
+        ops = {
+            "eq": lambda a, b: a == b, "ne": lambda a, b: a != b,
+            "gt": lambda a, b: a > b, "lt": lambda a, b: a < b,
+            "gte": lambda a, b: a >= b, "lte": lambda a, b: a <= b,
+        }
+        for cond in conditions:
+            actual = getattr(character, cond.code, None)
+            if actual is None:
+                for nested in (character.stats, character.skills, character.equipment):
+                    if hasattr(nested, cond.code):
+                        actual = getattr(nested, cond.code)
+                        break
+            compare = ops.get(cond.operator)
+            if actual is None or compare is None or not compare(actual, cond.value):
+                return False
+        return True
+
+    def meets_conditions(self, character, conditions) -> bool:
+        """Public wrapper around _conditions_met, for callers outside this
+        module (e.g. planning.GearList.for_upgrades) that need to check an
+        item's conditions against a character."""
+        return self._conditions_met(character, conditions)
+
+    def get_craftable_for_character(self, character) -> List[Item]:
+        """Items whose craft-skill requirement your character currently meets."""
+        out = []
+        for item in self.get_all_items_obj():
+            if not item.craft:
+                continue
+            skill_level = getattr(character.skills, f"{item.craft.skill}_level", None)
+            if skill_level is not None and skill_level >= item.craft.level:
+                out.append(item)
+        return out
+
+    def get_equipable_for_character(self, character) -> List[Item]:
+        """Equipment-slot items your character's level/conditions currently allow."""
+        out = []
+        for item in self.get_all_items_obj():
+            if not item.is_equipable or item.level > character.level:
+                continue
+            if self._conditions_met(character, item.conditions):
+                out.append(item)
+        return out

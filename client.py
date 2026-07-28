@@ -26,6 +26,7 @@ class CharacterAlreadyAtDestinationError(APIError):
 
 class CharacterInCooldownError(APIError):
     """Code 499"""
+    print("InCooldownERROR code 499 (this should never happen)")
     pass
 
 class InventoryFullError(APIError):

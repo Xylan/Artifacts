@@ -5,6 +5,7 @@ from .map_store import MapStore
 from .item_store import ItemStore
 from .monster_store import MonsterStore
 from .resource_store import ResourceStore
+from .task_store import TaskStore
 
 class GameDatabase():
     """Unified manager sharing a single SQLite file across domain stores."""
@@ -23,6 +24,9 @@ class GameDatabase():
         self.items = ItemStore(db_path=self.db_path, api=self.api, ttl_seconds=ttl_seconds)
         self.monsters = MonsterStore(db_path=self.db_path, api=self.api, ttl_seconds=ttl_seconds)
         self.resources = ResourceStore(db_path=self.db_path, api=self.api, ttl_seconds=ttl_seconds)
+        # Not TTL-cached (unlike the stores above) -- persists in-progress
+        # GearPlan tasks across restarts. See planning.py / task_store.py.
+        self.tasks = TaskStore(db_path=self.db_path, api=self.api)
 
     async def sync_all(self, force: bool = False, concurrent: bool = False) -> Tuple[int, int, int]:
         """Delegates cache refresh sequentially with a shared connection context to avoid locks."""

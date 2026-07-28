@@ -133,3 +133,12 @@ class ResourceStore(BaseStore):
                 if any(drop.get("code") == item_code for drop in drops):
                     matching_resources.append(data)
             return matching_resources
+
+    def find_best_for_item(self, item_code: str) -> Optional[Dict[str, Any]]:
+        """Picks the lowest-level resource node that drops item_code -- used
+        by planning.GearList.resolve() to turn a needed raw material into a
+        gather task."""
+        candidates = self.get_resources_dropping_item(item_code)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda r: r.get("level", 1))
