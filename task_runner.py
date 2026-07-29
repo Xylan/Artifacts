@@ -134,12 +134,16 @@ class TaskEngine:
             existing.target_quantity += quantity
             if existing.kind == OrderKind.CRAFT:
                 self._bump_ingredients(existing, quantity, tier)
-            if requester and not existing.requester:
-                existing.requester = requester
-                existing.equip_slot = equip_slot
+            if requester and equip_slot:
+                # Queue this recipient too, rather than only ever honoring
+                # the first character who ever requested `code` -- multiple
+                # characters wanting the same upgrade is the common case
+                # (request_upgrades_for is called once per character).
+                existing.equip_requests.extend([(requester, equip_slot)] * quantity)
             return existing.id
 
         item = self.db.items.get_item_obj(code)
+        equip_requests = [(requester, equip_slot)] * quantity if requester and equip_slot else []
         if item and item.craft:
             produces = max(1, item.craft.quantity)
             crafts_needed = -(-quantity // produces)  # ceil
@@ -149,7 +153,7 @@ class TaskEngine:
                 code=code, node_code=item.craft.skill, skill=item.craft.skill,
                 skill_level=item.craft.level, target_quantity=quantity,
                 produces_per_action=produces, parent_id=parent_id,
-                requester=requester, equip_slot=equip_slot,
+                equip_requests=equip_requests,
             )
             self.orders[order.id] = order
             for ing in item.craft.items:
@@ -166,7 +170,7 @@ class TaskEngine:
                 code=code, node_code=resource["code"], skill=resource["skill"],
                 skill_level=resource["level"], target_quantity=quantity,
                 produces_per_action=int(avg_yield), parent_id=parent_id,
-                requester=requester, equip_slot=equip_slot,
+                equip_requests=equip_requests,
             )
             self.orders[order.id] = order
             return order.id
@@ -358,7 +362,22 @@ class TaskEngine:
 
         best, best_score = None, float("-inf")
 
-        if current and not current.done and self.character_eligible(character, current):
+        # Inertia only applies while `current` is still actually workable --
+        # previously this branch skipped the target/materials checks applied
+        # to every other order below, so once a craft order's ingredients ran
+        # dry the character stayed locked onto it via inertia forever
+        # (character_eligible alone doesn't catch that; it only checks
+        # skill level / lock ownership, not live material stock). That was
+        # why crafting characters got stuck spinning on one dead order
+        # instead of falling through to other craftable/gatherable work.
+        current_still_workable = (
+            current is not None
+            and not current.done
+            and self.character_eligible(character, current)
+            and current.target_quantity > self.held(current.code)
+            and (current.kind != OrderKind.CRAFT or self._materials_available(character, current))
+        )
+        if current_still_workable:
             inertia = 0 if current.priority == Priority.DEFAULT else INERTIA_BONUS
             best, best_score = current, self._score(character, current) + inertia
 
@@ -456,16 +475,27 @@ class TaskEngine:
             print(f"[{character.name}] Switching off '{old_order.code}' "
                   f"({'idle' if new_order is None else new_order.code} next).")
             self.release(character, old_order)
-            # Requirement #4: deposit inventory whenever switching tasks. No
-            # need to walk back afterward -- we're about to claim a new
-            # order (or go idle) right below, so returning to the
-            # pre-deposit tile would just be an extra trip for nothing.
-            if not character.is_inventory_empty:
-                await character.actions.deposit_all(return_to_origin=False)
-                await self.account.sync_bank()
 
+        # Claim immediately, before any await below -- this is what select_order_for()
+        # relies on to make order.locked_to trustworthy. select_order_for() (sync) and
+        # this claim() call happen back-to-back on the same event-loop tick with nothing
+        # in between that can yield, so no other character's coroutine can run its own
+        # select_order_for() in the gap and see this order as still unclaimed. Claiming
+        # used to happen AFTER the deposit await below, which meant two (or more)
+        # characters could each pass the "not locked" check in select_order_for() before
+        # either of them actually set locked_to -- both would then proceed to work the
+        # same CRAFT order concurrently (duplicate withdraws/crafts against the same
+        # materials). Moving claim() up here closes that window.
         if new_order:
             self.claim(character, new_order)
+
+        if old_order and not character.is_inventory_empty:
+            # Requirement #4: deposit inventory whenever switching tasks. No
+            # need to walk back afterward -- the character is already
+            # claimed onto the new order (or idle) above, so returning to
+            # the pre-deposit tile would just be an extra trip for nothing.
+            await character.actions.deposit_all(return_to_origin=False)
+            await self.account.sync_bank()
 
     async def _try_deliver_equipment(self, character, order: WorkOrder) -> None:
         """Once a requested item is fully produced, hand it to the
@@ -533,7 +563,12 @@ class TaskEngine:
         if max_by_materials <= 0:
             return 0
 
-        return max(1, min(crafts_needed, max_by_space, max_by_materials))
+        # No forced minimum of 1 here -- max_by_space can independently be 0
+        # (inventory already full of something else), and forcing a craft
+        # attempt through in that case just fails downstream with an
+        # inventory-full error instead of cleanly reporting 0 and letting
+        # the caller back off.
+        return min(crafts_needed, max_by_space, max_by_materials)
 
     async def _run_craft_step(self, character, order: WorkOrder) -> None:
         remaining = order.target_quantity - self.held(order.code)
@@ -542,18 +577,27 @@ class TaskEngine:
         item = self.db.items.get_item_obj(order.code)
         batch = crafts_needed
 
+        map_db = self.db.maps
+        to_withdraw = []
+
         if item and item.craft:
             batch = self._craft_batch_size(character, item, crafts_needed)
             if batch <= 0:
+                # Nothing craftable right now -- either the select_order_for
+                # check that approved this order raced with another
+                # character consuming the same ingredients, or (for the
+                # `current`-order inertia path) materials just ran out.
+                # Release rather than sleep-and-retry: staying claimed here
+                # would keep this exact dead order winning via inertia next
+                # loop instead of the character picking up other work.
                 print(f"[{character.name}] Not enough '{order.code}' ingredients on hand "
-                      f"(own inventory + bank) to craft right now; waiting for materials.")
-                await asyncio.sleep(self.poll_interval)
+                      f"(own inventory + bank) to craft right now; releasing and looking for other work.")
+                self.release(character, order)
                 return
             if batch < crafts_needed:
                 print(f"[{character.name}] Sizing '{order.code}' craft batch to {batch}/{crafts_needed} "
                       f"actions to fit available inventory/materials.")
 
-            to_withdraw = []
             for ing in item.craft.items:
                 needed_qty = ing.quantity * batch
                 have_inv = next((i.quantity for i in character.inventory if i.code == ing.code), 0)
@@ -563,11 +607,28 @@ class TaskEngine:
                     withdraw_qty = min(shortfall, bank_qty)
                     if withdraw_qty > 0:
                         to_withdraw.append({"code": ing.code, "quantity": withdraw_qty})
-            if to_withdraw:
-                await character.actions.withdraw_items(to_withdraw)
-                await self.account.sync_bank()
 
-        await character.actions.craft(order.code, quantity=batch, workshop=order.skill, map_db=self.db.maps)
+        # Chain bank -> workshop -> bank directly (via the private _execute_*
+        # methods + explicit smart_move) instead of letting withdraw_items()/
+        # craft()/deposit_all() each independently "move there and return to
+        # origin" via temporary_relocate. That was producing two full round
+        # trips per batch -- workshop -> bank -> workshop (withdraw's own
+        # return) -> workshop (craft, a no-op move) -> bank -> workshop
+        # (deposit's own return) -- instead of one bank -> workshop -> bank
+        # pass.
+        if to_withdraw:
+            bank_pos = character.actions.get_closest_bank(map_db)
+            if bank_pos:
+                await character.actions.smart_move(bank_pos, map_db=map_db)
+                await character.actions._execute_withdraw_items(to_withdraw)
+                await self.account.sync_bank()
+            else:
+                print(f"[{character.name}] Could not resolve a bank to withdraw '{order.code}' ingredients.")
+
+        workshop_pos = map_db.find_closest(character, order.skill) if order.skill else None
+        if workshop_pos:
+            await character.actions.smart_move(workshop_pos, map_db=map_db)
+        await character.actions._execute_craft(order.code, batch)
 
         # Deposit after every crafting batch (not just when the inventory
         # is completely full or the order finishes) so freshly-crafted
@@ -575,8 +636,14 @@ class TaskEngine:
         # immediately, where other characters/orders relying on it can see
         # it via held().
         if not character.is_inventory_empty:
-            await character.actions.deposit_all()
-            await self.account.sync_bank()
+            bank_pos = character.actions.get_closest_bank(map_db)
+            if bank_pos:
+                await character.actions.smart_move(bank_pos, map_db=map_db)
+                await character.actions._execute_deposit([
+                    {"code": i.code, "quantity": i.quantity}
+                    for i in character.inventory if i.code and i.quantity > 0
+                ])
+                await self.account.sync_bank()
 
         if self.held(order.code) >= order.target_quantity:
             self.complete(order)

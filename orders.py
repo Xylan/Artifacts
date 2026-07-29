@@ -14,7 +14,7 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional, Set
+from typing import List, Optional, Set, Tuple
 
 _id_counter = itertools.count(1)
 
@@ -58,8 +58,17 @@ class WorkOrder:
     target_quantity: int = 0
     produces_per_action: int = 1
     parent_id: Optional[int] = None       # order this ingredient serves, if any (for plan-tree/verify)
-    requester: Optional[str] = None       # character who wants the finished item delivered + equipped
-    equip_slot: Optional[str] = None
+    # Queue of (character_name, equip_slot) pairs -- one entry per unit of
+    # `code` that some character wants delivered from the bank and equipped
+    # once available. Supports multiple recipients wanting the same item:
+    # 5 characters all needing a copper_boots upgrade collapse into ONE
+    # order (target_quantity=5) with 5 queued equip_requests, rather than
+    # each getting their own duplicate order. This used to be a single
+    # requester/equip_slot pair, which meant only the FIRST character to
+    # request an item ever got it delivered -- everyone else's share just
+    # sat in the bank forever once the order was marked done. See
+    # TaskEngine._try_deliver_equipment / _delivery_loop.
+    equip_requests: List[Tuple[str, str]] = field(default_factory=list)
     only_for: Optional[str] = None        # restricts claimability to a single character (default tasks)
     locked_to: Optional[str] = None       # CRAFT only: character holding the exclusive claim
     claimed_by: Set[str] = field(default_factory=set)   # GATHER: characters currently working it

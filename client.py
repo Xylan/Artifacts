@@ -80,7 +80,25 @@ class ArtifactsAPI:
         instead of just the "data" field. Needed for paginated list
         endpoints (e.g. /maps, /items, /monsters) so callers can tell
         how many pages remain.
+
+        When `character` is given, the ENTIRE request (cooldown wait through
+        response handling) runs under that character's action_lock, so at
+        most one action against a given character is ever in flight --
+        regardless of which coroutine issued it (the character's own
+        character_loop, or another character's coroutine acting on it via
+        e.g. TaskEngine._try_deliver_equipment). Without this, two
+        coroutines could both see the character's cooldown as satisfied and
+        fire overlapping requests, racing on cooldown state.
         """
+        if character:
+            async with character.action_lock:
+                return await self._send_request(method, endpoint, character, payload, params, return_full)
+        return await self._send_request(method, endpoint, character, payload, params, return_full)
+
+    async def _send_request(self, method: str, endpoint: str, character=None, payload=None, params=None, return_full: bool = False) -> dict:
+        """Does the actual work for request() -- kept separate so request()
+        can wrap it in the character's action_lock without that lock also
+        (re-)wrapping this inner call."""
         if character:
             await character.wait_cooldown()
 

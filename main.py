@@ -11,7 +11,7 @@ import nest_asyncio
 from client import ArtifactsAPI, InventoryFullError
 from database import GameDatabase
 from account import Account
-from roles import ensure_naming_scheme, DEFAULT_ROLES
+from roles import ensure_naming_scheme, build_roles
 from task_runner import TaskEngine
 
 nest_asyncio.apply()
@@ -35,7 +35,12 @@ async def main():
 
         print(f"Loading finished. {account!r}")
 
-        engine = TaskEngine(account, db, roles=DEFAULT_ROLES)
+        # Build roles against the roster's ACTUAL names (rename above is
+        # best-effort and silently no-ops without an active membership --
+        # see ensure_naming_scheme), not the aspirational Xylan1..Xylan5
+        # scheme, so role/skill assignment always lines up with real names.
+        roles = build_roles(list(account.characters.keys()))
+        engine = TaskEngine(account, db, roles=roles)
 
         # Requirement #4, "Clean Slate": deposit everyone's gold/inventory
         # into the bank before the scheduler starts handing out work.

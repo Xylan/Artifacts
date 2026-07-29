@@ -49,16 +49,57 @@ class CharacterRole:
     gather_priority: List[str] = field(default_factory=list)  # cascading order, best-first
 
 
+# Role templates, in assignment order -- position in this list (not any
+# particular name string) is what determines who gets what. Applied to
+# whatever roster names actually exist via build_roles() below, since
+# renaming to NAME_SCHEME is best-effort (requires an active membership --
+# see ensure_naming_scheme) and silently no-ops when it fails, leaving
+# characters under their original names.
+#
+# Keying a roles dict to literal "Xylan1".."Xylan5" strings meant every
+# role lookup silently missed whenever rename didn't go through, with two
+# compounding effects: assign_default_gather_tasks() fell back to the
+# untailored GATHER_SKILLS order (mining first, for everyone), AND
+# _craft_allowed()'s primary_owner_of() lookup resolved to a name that
+# isn't in account.characters, so `owner` came back None, owner_level
+# defaulted to 0, and `0 >= CRAFT_ALLOWANCE_LEVEL` was always False --
+# silently locking every pure-craft-skill order for every character, all
+# the time, which is also why everyone kept falling back to the
+# copper_ore default even once craft materials were available.
+ROLE_TEMPLATES: List[CharacterRole] = [
+    CharacterRole("", "weaponcrafting", ["mining", "woodcutting", "fishing", "alchemy"]),
+    CharacterRole("", "gearcrafting", ["woodcutting", "fishing", "alchemy", "mining"]),
+    CharacterRole("", "jewelrycrafting", ["fishing", "alchemy", "mining", "woodcutting"]),
+    CharacterRole("", "cooking", ["alchemy", "mining", "woodcutting", "fishing"]),
+    CharacterRole("", None, ["mining", "fishing", "woodcutting", "alchemy"]),
+]
+
+
+def build_roles(character_names: List[str]) -> Dict[str, CharacterRole]:
+    """Assigns ROLE_TEMPLATES positionally (sorted for determinism) to
+    whatever character names actually exist on the account right now --
+    the roster's *actual* names, whether or not ensure_naming_scheme
+    managed to rename them. Call this after ensure_naming_scheme() (or
+    after account.sync_characters(), if skipping the naming scheme
+    entirely) and pass the result to TaskEngine(roles=...). Re-call and
+    rebuild if the roster changes (character created/deleted/renamed) --
+    don't hang onto a roles dict built from a stale roster."""
+    roles: Dict[str, CharacterRole] = {}
+    for i, name in enumerate(sorted(character_names)):
+        template = ROLE_TEMPLATES[i % len(ROLE_TEMPLATES)]
+        roles[name] = CharacterRole(name, template.primary_craft, list(template.gather_priority))
+    return roles
+
+
 # Default 5-character layout: one dedicated crafter per pure craft skill,
 # plus a floater (Xylan5) who's eligible to help any craft skill from the
 # start -- useful both before allowance opens things up for everyone else,
 # and to fill in the leftover slot (4 pure craft skills, 5 characters).
+# Kept for callers that want a roles dict before a live roster exists
+# (docs/tests/etc). Live code should prefer build_roles(actual_names).
 DEFAULT_ROLES: Dict[str, CharacterRole] = {
-    "Xylan1": CharacterRole("Xylan1", "weaponcrafting", ["mining", "woodcutting", "fishing", "alchemy"]),
-    "Xylan2": CharacterRole("Xylan2", "gearcrafting", ["woodcutting", "fishing", "alchemy", "mining"]),
-    "Xylan3": CharacterRole("Xylan3", "jewelrycrafting", ["fishing", "alchemy", "mining", "woodcutting"]),
-    "Xylan4": CharacterRole("Xylan4", "cooking", ["alchemy", "mining", "woodcutting", "fishing"]),
-    "Xylan5": CharacterRole("Xylan5", None, ["mining", "fishing", "woodcutting", "alchemy"]),
+    name: CharacterRole(name, t.primary_craft, list(t.gather_priority))
+    for name, t in zip(NAME_SCHEME, ROLE_TEMPLATES)
 }
 
 

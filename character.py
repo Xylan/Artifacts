@@ -143,6 +143,20 @@ class Character:
         from CharacterActions import CharacterActions
         self.actions: CharacterActions = CharacterActions(self, api, map_db)
 
+        # Serializes every API-calling action against THIS character,
+        # regardless of which coroutine issues it. Without this, two
+        # coroutines can end up acting on the same character concurrently --
+        # e.g. this character's own character_loop mid-action while a
+        # DIFFERENT character's coroutine calls _try_deliver_equipment() on
+        # this one after finishing a craft order that was requested for it.
+        # Both would independently call character.wait_cooldown(), see the
+        # cooldown as satisfied, and fire overlapping requests -- producing
+        # CharacterInCooldownError races and, in the worst case, malformed
+        # in-flight state. ArtifactsAPI.request() acquires this before doing
+        # anything else whenever a character is passed in, so at most one
+        # action per character is ever in flight.
+        self.action_lock = asyncio.Lock()
+
         # Complex / Grouped Sub-Models
         self.skills = Skills(
             mining_level=data["mining_level"],
@@ -358,6 +372,21 @@ class Character:
             raise ValueError("Invalid target format. Expected Location, Position, (x, y) tuple, or x, y integers.")
 
         return self.location.position.x == target_x and self.location.position.y == target_y
+
+    def __getstate__(self):
+        """Prevents Spyder/pickle from crashing on the non-picklable asyncio.Lock
+        (self.actions already nulls its own api reference via its own
+        __getstate__). A fresh lock is recreated on unpickle -- lock identity
+        doesn't need to survive a pickle round-trip, only its serializing
+        behavior within a running process."""
+        state = self.__dict__.copy()
+        state["action_lock"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.__dict__.get("action_lock") is None:
+            self.action_lock = asyncio.Lock()
 
     def __getattr__(self, name: str) -> Any:
         """Only invoked when normal attribute lookup fails (so it never
