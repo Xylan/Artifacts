@@ -40,7 +40,7 @@ async def main():
         # see ensure_naming_scheme), not the aspirational Xylan1..Xylan5
         # scheme, so role/skill assignment always lines up with real names.
         roles = build_roles(list(account.characters.keys()))
-        engine = TaskEngine(account, db, roles=roles)
+        engine = TaskEngine(account, db, roles=roles)   
 
         # Requirement #4, "Clean Slate": deposit everyone's gold/inventory
         # into the bank before the scheduler starts handing out work.

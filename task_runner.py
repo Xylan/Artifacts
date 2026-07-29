@@ -497,17 +497,33 @@ class TaskEngine:
             await character.actions.deposit_all(return_to_origin=False)
             await self.account.sync_bank()
 
-    async def _try_deliver_equipment(self, character, order: WorkOrder) -> None:
-        """Once a requested item is fully produced, hand it to the
-        requester and equip it (requirement #4)."""
-        if not order.requester or not order.equip_slot:
-            return
-        requester = self.account.characters.get(order.requester)
-        if not requester:
-            return
-        await requester.actions.withdraw_items([{"code": order.code, "quantity": 1}])
-        await requester.actions.equip(order.code, order.equip_slot)
-        print(f"[{requester.name}] Equipped '{order.code}' in {order.equip_slot}.")
+    async def _try_deliver_equipment(self, order: WorkOrder) -> None:
+        """Delivers and equips one unit of order.code to each queued
+        (character, slot) request in order.equip_requests, as bank stock
+        currently allows. Pops off only what it can actually fulfill right
+        now -- if the bank doesn't have enough for everyone yet, whatever's
+        left stays queued for the next call rather than being dropped.
+        Called both right after an order completes (best-effort, immediate)
+        and on every tick of _delivery_loop (so recipients who couldn't be
+        served at completion time -- e.g. only 1 of 5 requested copies had
+        actually landed in the bank yet -- still get theirs once the rest
+        of the order's crafting/gathering catches up)."""
+        while order.equip_requests:
+            bank_qty = next((i.quantity for i in self.account.bank.items if i.code == order.code), 0)
+            if bank_qty <= 0:
+                break
+
+            char_name, slot = order.equip_requests[0]
+            requester = self.account.characters.get(char_name)
+            if not requester:
+                order.equip_requests.pop(0)
+                continue
+
+            await requester.actions.withdraw_items([{"code": order.code, "quantity": 1}])
+            await self.account.sync_bank()
+            await requester.actions.equip(order.code, slot)
+            print(f"[{requester.name}] Equipped '{order.code}' in {slot}.")
+            order.equip_requests.pop(0)
 
     async def _run_gather_step(self, character, order: WorkOrder) -> None:
         await character.actions.gather(resource=order.node_code, map_db=self.db.maps)
@@ -521,7 +537,7 @@ class TaskEngine:
                 await character.actions.deposit_all()
                 await self.account.sync_bank()
             self.complete(order)
-            await self._try_deliver_equipment(character, order)
+            await self._try_deliver_equipment(order)
 
     def _craft_batch_size(self, character, item, crafts_needed: int) -> int:
         """Bounds a craft run to however many actions actually fit in the
@@ -647,7 +663,7 @@ class TaskEngine:
 
         if self.held(order.code) >= order.target_quantity:
             self.complete(order)
-            await self._try_deliver_equipment(character, order)
+            await self._try_deliver_equipment(order)
 
     async def character_loop(self, character) -> None:
         while self.running:
@@ -687,6 +703,22 @@ class TaskEngine:
         await asyncio.gather(*(_clean_slate(c) for c in self.account.characters.values()))
         await self.account.sync_bank()
 
+    async def _delivery_loop(self) -> None:
+        """Periodically sweeps every order for pending equip_requests and
+        delivers/equips whatever the bank can currently supply. Decoupled
+        from order completion because a single completion event only
+        catches whatever's deliverable at that instant -- with multiple
+        recipients queued on one order (e.g. 5 characters all wanting a
+        copper_boots upgrade), the rest may still be mid-craft or waiting
+        on a bank sync at that moment. Previously a 'done' order was never
+        revisited, so any recipients not served at that exact instant just
+        sat undelivered in the bank forever."""
+        while self.running:
+            for order in list(self.orders.values()):
+                if order.equip_requests:
+                    await self._try_deliver_equipment(order)
+            await asyncio.sleep(self.poll_interval)
+
     async def run(self) -> None:
         self.assign_default_gather_tasks()
         self.refresh_stock_orders()
@@ -695,6 +727,7 @@ class TaskEngine:
 
         self.running = True
         loops = [self.character_loop(c) for c in self.account.characters.values()]
+        loops.append(self._delivery_loop())
         await asyncio.gather(*loops)
 
     def stop(self) -> None:
