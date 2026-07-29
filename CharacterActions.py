@@ -67,16 +67,23 @@ class CharacterActions:
         return active_db.find_closest(self.character, "bank")
 
     def is_at_bank(self, map_db: Optional[MapStore] = None) -> bool:
-        """Checks if character's current position matches the closest bank position."""
+        """Checks if character's current position (including layer) matches the closest bank position."""
         closest_bank = self.get_closest_bank(map_db)
         if not closest_bank:
             return False
 
         current_x = self.character.location.position.x
         current_y = self.character.location.position.y
-        bank_x, bank_y = closest_bank[0], closest_bank[1]
+        current_layer = self.character.location.layer
+        bank_x, bank_y, bank_layer = closest_bank[0], closest_bank[1], closest_bank[2]
 
-        return current_x == bank_x and current_y == bank_y
+        # find_closest() can return a bank on a DIFFERENT layer than the
+        # character (e.g. no bank on the current layer, so it falls back to
+        # searching across all layers). Comparing only x/y let a same-coordinate
+        # tile on another layer register as "at the bank" -- causing bank
+        # actions to fire without ever navigating there (API error 598: Bank
+        # not found on this map).
+        return current_x == bank_x and current_y == bank_y and current_layer == bank_layer
 
     # ------------------------------------------------------------------
     # Movement

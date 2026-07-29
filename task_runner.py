@@ -716,7 +716,15 @@ class TaskEngine:
         while self.running:
             for order in list(self.orders.values()):
                 if order.equip_requests:
-                    await self._try_deliver_equipment(order)
+                    try:
+                        await self._try_deliver_equipment(order)
+                    except Exception as e:
+                        # Mirrors character_loop's per-order guard: one failed
+                        # delivery (e.g. a bank/API hiccup) must not propagate
+                        # out of asyncio.gather() in run() and tear down every
+                        # other character's loop along with it.
+                        print(f"[TaskEngine] Error delivering equipment for order #{order.id} "
+                              f"'{order.code}': {e!r}")
             await asyncio.sleep(self.poll_interval)
 
     async def run(self) -> None:
