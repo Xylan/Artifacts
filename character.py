@@ -157,6 +157,24 @@ class Character:
         # action per character is ever in flight.
         self.action_lock = asyncio.Lock()
 
+        # Guards a whole multi-step "navigate then act" sequence (e.g.
+        # move-to-bank -> withdraw -> equip, or move-to-resource -> gather)
+        # against a DIFFERENT concurrent sequence touching this same
+        # character -- e.g. TaskEngine._delivery_loop() delivering an
+        # equipped item to this character while this character's own
+        # character_loop is mid-gather. action_lock alone doesn't prevent
+        # this: it only serializes individual HTTP calls, so two unrelated
+        # multi-call sequences can still interleave their moves/actions
+        # between each other's individual lock acquisitions, leaving the
+        # character standing somewhere neither sequence expects (surfacing
+        # as spurious 598 "not found on this map" / 490 "already at
+        # destination" errors). Deliberately a SEPARATE lock from
+        # action_lock rather than reusing it here, since asyncio.Lock isn't
+        # reentrant -- wrapping one of these sequences in `async with
+        # action_lock` would deadlock the very first inner api.request()
+        # call, which re-acquires action_lock itself.
+        self.busy_lock = asyncio.Lock()
+
         # Complex / Grouped Sub-Models
         self.skills = Skills(
             mining_level=data["mining_level"],
@@ -381,12 +399,15 @@ class Character:
         behavior within a running process."""
         state = self.__dict__.copy()
         state["action_lock"] = None
+        state["busy_lock"] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         if self.__dict__.get("action_lock") is None:
             self.action_lock = asyncio.Lock()
+        if self.__dict__.get("busy_lock") is None:
+            self.busy_lock = asyncio.Lock()
 
     def __getattr__(self, name: str) -> Any:
         """Only invoked when normal attribute lookup fails (so it never

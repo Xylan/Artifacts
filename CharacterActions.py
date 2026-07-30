@@ -462,8 +462,16 @@ class CharacterActions:
         return await self.api.equip(self.character, items)
 
     async def equip(self, code: str, slot: str, quantity: int = 1) -> dict:
-        """Convenience wrapper for equipping a single item."""
-        payload = {"code": code, "slot": slot, "quantity": quantity}
+        """Convenience wrapper for equipping a single item.
+
+        Accepts either the API's bare ItemSlot value ('shield', 'ring1', ...)
+        or the internal Equipment-attribute spelling used elsewhere in this
+        codebase ('shield_slot', 'ring1_slot', ...) and normalizes to the
+        former -- the EquipSchema.slot enum the API actually expects has no
+        '_slot' suffix, and sending the suffixed form fails with a 422
+        Invalid payload."""
+        api_slot = slot[:-5] if slot.endswith("_slot") else slot
+        payload = {"code": code, "slot": api_slot, "quantity": quantity}
         return await self.equip_items([payload])
 
     @sync_character_state
@@ -472,8 +480,10 @@ class CharacterActions:
         return await self.api.unequip(self.character, slots)
 
     async def unequip(self, slot: str, quantity: int = 1) -> dict:
-        """Convenience wrapper for unequipping a single slot."""
-        payload = {"slot": slot, "quantity": quantity}
+        """Convenience wrapper for unequipping a single slot. Same '_slot'-suffix
+        normalization as equip() -- see its docstring."""
+        api_slot = slot[:-5] if slot.endswith("_slot") else slot
+        payload = {"slot": api_slot, "quantity": quantity}
         return await self.unequip_items([payload])
 
     @sync_character_state

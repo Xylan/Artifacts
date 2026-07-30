@@ -519,9 +519,17 @@ class TaskEngine:
                 order.equip_requests.pop(0)
                 continue
 
-            await requester.actions.withdraw_items([{"code": order.code, "quantity": 1}])
-            await self.account.sync_bank()
-            await requester.actions.equip(order.code, slot)
+            # busy_lock serializes this whole move-withdraw-equip sequence
+            # against `requester`'s own character_loop iteration (see
+            # Character.busy_lock) -- without it, this delivery (running
+            # from the separate _delivery_loop task) could interleave its
+            # moves with a gather/craft step the requester's own loop is
+            # mid-way through, leaving them standing somewhere neither side
+            # expects (spurious 598/490 errors).
+            async with requester.busy_lock:
+                await requester.actions.withdraw_items([{"code": order.code, "quantity": 1}])
+                await self.account.sync_bank()
+                await requester.actions.equip(order.code, slot)
             print(f"[{requester.name}] Equipped '{order.code}' in {slot}.")
             order.equip_requests.pop(0)
 
@@ -668,19 +676,30 @@ class TaskEngine:
     async def character_loop(self, character) -> None:
         while self.running:
             order = self.select_order_for(character)
-            await self._switch_task(character, order)
 
-            if order is None:
-                await asyncio.sleep(self.poll_interval)
-                continue
+            # Holds busy_lock for the whole switch+act cycle so that a
+            # concurrent _try_deliver_equipment() call targeting this same
+            # character (from _delivery_loop, a separate task) can't
+            # interleave its own moves in between this loop's move-then-act
+            # steps. See Character.busy_lock for why this can't just reuse
+            # action_lock.
+            async with character.busy_lock:
+                await self._switch_task(character, order)
 
-            try:
-                if order.kind == OrderKind.GATHER:
-                    await self._run_gather_step(character, order)
+                if order is None:
+                    do_sleep = True
                 else:
-                    await self._run_craft_step(character, order)
-            except Exception as e:
-                print(f"[{character.name}] Error running order #{order.id} '{order.code}': {e!r}")
+                    do_sleep = False
+                    try:
+                        if order.kind == OrderKind.GATHER:
+                            await self._run_gather_step(character, order)
+                        else:
+                            await self._run_craft_step(character, order)
+                    except Exception as e:
+                        print(f"[{character.name}] Error running order #{order.id} '{order.code}': {e!r}")
+                        do_sleep = True
+
+            if do_sleep:
                 await asyncio.sleep(self.poll_interval)
 
     # ------------------------------------------------------------------
