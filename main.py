@@ -51,8 +51,14 @@ async def main():
         for character in account.characters.values():
             engine.request_upgrades_for(character)
 
-        # Requirement #5, keep-in-stock example -- tune/add freely:
+        # Requirement #5, keep-in-stock: loaded from stock_config.json, a JSON
+        # object of {"item_code": minimum_quantity} pairs at the project root.
+        # Edit that file (add/change/remove entries) any time -- it's reloaded
+        # periodically while the engine runs, so changes take effect without a
+        # restart. add_stock_rule() is still available for one-off rules set
+        # in code, e.g.:
         # engine.add_stock_rule("cooked_chicken", 20)
+        engine.load_stock_rules_from_file()
 
         # Requirement #5, default-task example -- zero inertia, only used
         # when nothing else is claimable for that character:

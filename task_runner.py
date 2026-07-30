@@ -13,10 +13,19 @@ released, and completed while characters are already mid-run -- and every
 character repeatedly asks "what's the best thing I could be doing right
 now?" at well-defined breakpoints.
 
-Priority tiers (orders.Priority): CRAFT > GATHER > KEEP_STOCK > DEFAULT.
-See orders.INERTIA_BONUS for the anti-thrashing bias applied to whatever
-order a character is currently working; DEFAULT-tier orders get none, so
-they're preempted immediately by anything else (zero inertia).
+Priority tiers (orders.Priority): EQUIP > CRAFT > GATHER > KEEP_STOCK >
+AUTO_CRAFT > DEFAULT. EQUIP is reserved for equip requests
+(TaskEngine.request_equipment) and outranks everything else -- including
+CRAFT plus the inertia bonus below -- so a character waiting on gear
+preempts whatever they're currently doing rather than finishing it first.
+AUTO_CRAFT sits just above DEFAULT busywork: it auto-converts surplus of a
+"pure" single-use default-gathered raw material (one that's only ever an
+ingredient in exactly one recipe, e.g. copper_ore -> copper_bar) into its
+finished item, without ever eating into that raw material's keep-in-stock
+floor -- see TaskEngine.refresh_auto_convert_orders(). See orders.INERTIA_BONUS
+for the anti-thrashing bias applied to whatever order a character is
+currently working; DEFAULT-tier orders get none, so they're preempted
+immediately by anything else (zero inertia).
 
 Breakpoints: a gathering character only re-evaluates for a *different*
 order right after a bank deposit (inventory-full flush, or its target being
@@ -29,11 +38,14 @@ natural breakpoints, such as when the character visits the bank."
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from account import Account
 from database import GameDatabase
+from models import Item
 from orders import WorkOrder, OrderKind, Priority, INERTIA_BONUS
 from roles import (
     CharacterRole, DEFAULT_ROLES, PURE_CRAFT_SKILLS, GATHER_SKILLS,
@@ -67,10 +79,20 @@ class TaskEngine:
 
         self.orders: Dict[int, WorkOrder] = {}
         self.stock_rules: List[StockRule] = []
+        # Path most recently passed to load_stock_rules_from_file(), if any --
+        # remembered so _stock_config_loop can keep re-reading the same file
+        # on a timer without the caller having to pass the path twice.
+        self._stock_config_path: Optional[str] = None
         self.default_orders: Dict[str, WorkOrder] = {}   # character name -> its DEFAULT-tier order
 
         self._current_order: Dict[str, Optional[int]] = {}  # character name -> order id they're on
         self.running = False
+
+        # code -> the single Item that consumes it, for every default-gathered
+        # raw material that's an ingredient in exactly one recipe. Computed
+        # once (lazily, from the full item catalog) and cached -- see
+        # _build_single_use_conversions()/refresh_auto_convert_orders().
+        self._single_use_conversions: Optional[Dict[str, Item]] = None
 
     # ------------------------------------------------------------------
     # Holdings
@@ -114,12 +136,15 @@ class TaskEngine:
 
         `tier=None` (the default) gives each generated order its "natural"
         priority: CRAFT for craftable items, GATHER for gatherable ones --
-        this is what request_upgrades_for()/request_equipment() use, so a
-        gear request's own craft step outranks its ingredient gather steps,
         per the Crafting > Gathering rule. Passing tier=Priority.KEEP_STOCK
         (or DEFAULT) instead forces that single tier across the whole
         expansion, so a keep-in-stock request never jumps ahead of a
         genuine equipment/gather request even if it happens to be craftable.
+        request_equipment() below instead forces tier=Priority.EQUIP across
+        the whole expansion (top-level order AND every recursive ingredient
+        order), so an equip request -- craft step, gather steps, all of it --
+        outranks and interrupts ordinary CRAFT/GATHER work rather than just
+        matching its natural tier and waiting in line behind it.
 
         Returns the id of the top-level order for `code`, or None if `code`
         is neither craftable nor gatherable (buy it manually). Safe to call
@@ -142,8 +167,27 @@ class TaskEngine:
                 existing.equip_requests.extend([(requester, equip_slot)] * quantity)
             return existing.id
 
-        item = self.db.items.get_item_obj(code)
+        # Check the bank before spinning up a new craft/gather order -- if
+        # `code` is already sitting in the bank in sufficient quantity,
+        # there's nothing left to produce. Previously a new order was
+        # created unconditionally here: since select_order_for() already
+        # refuses to hand out any order whose target is <= held() (bank +
+        # inventories), an order that was fully covered by existing bank
+        # stock the moment it was created would never get claimed/worked by
+        # anyone -- but it also never ran through complete() (that only
+        # fires at the end of _run_craft_step/_run_gather_step), so it just
+        # sat in self.orders forever showing up as a "live" craft/gather
+        # request for an item that, in practice, was already finished, and
+        # any equip_requests attached to it never got delivered. Marking it
+        # done immediately when the bank already covers it fixes both: the
+        # order stops looking like unfinished work, and delivery (which
+        # only cares about equip_requests, not order.done) proceeds right
+        # away instead of waiting on a completion event that was never
+        # going to happen.
+        bank_qty = next((i.quantity for i in self.account.bank.items if i.code == code), 0)
         equip_requests = [(requester, equip_slot)] * quantity if requester and equip_slot else []
+
+        item = self.db.items.get_item_obj(code)
         if item and item.craft:
             produces = max(1, item.craft.quantity)
             crafts_needed = -(-quantity // produces)  # ceil
@@ -156,8 +200,11 @@ class TaskEngine:
                 equip_requests=equip_requests,
             )
             self.orders[order.id] = order
-            for ing in item.craft.items:
-                self.request_item(ing.code, ing.quantity * crafts_needed, tier=tier, parent_id=order.id)
+            if bank_qty >= quantity:
+                self.complete(order)
+            else:
+                for ing in item.craft.items:
+                    self.request_item(ing.code, ing.quantity * crafts_needed, tier=tier, parent_id=order.id)
             return order.id
 
         resource = self.db.resources.find_best_for_item(code)
@@ -173,6 +220,8 @@ class TaskEngine:
                 equip_requests=equip_requests,
             )
             self.orders[order.id] = order
+            if bank_qty >= quantity:
+                self.complete(order)
             return order.id
 
         print(f"[TaskEngine] '{code}' is neither craftable nor gatherable -- skipping (buy/GE manually).")
@@ -189,8 +238,15 @@ class TaskEngine:
     def request_equipment(self, character_name: str, code: str, slot: str, quantity: int = 1) -> Optional[int]:
         """Requests `code` on behalf of `character_name`, who wants it
         delivered from the bank and equipped once the order completes --
-        see _try_deliver_equipment()."""
-        return self.request_item(code, quantity, requester=character_name, equip_slot=slot)
+        see _try_deliver_equipment(). Forces Priority.EQUIP across the
+        entire craft/gather expansion (the top-level order for `code` and
+        every recursive ingredient order request_item() spins up for it),
+        not just the top-level order -- an equip request is meant to
+        interrupt whatever a character is currently doing, and that only
+        works end-to-end if the ingredient-gathering/crafting steps feeding
+        it also outrank ordinary CRAFT/GATHER work along the way, not just
+        the final craft step."""
+        return self.request_item(code, quantity, tier=Priority.EQUIP, requester=character_name, equip_slot=slot)
 
     def request_upgrades_for(self, character) -> List[int]:
         """Wraps planning.GearList.for_upgrades: auto-detects every
@@ -217,6 +273,50 @@ class TaskEngine:
     def add_stock_rule(self, code: str, minimum: int) -> None:
         self.stock_rules.append(StockRule(code=code, minimum=minimum))
 
+    def load_stock_rules_from_file(self, path: str = "stock_config.json") -> None:
+        """Reads a JSON object of {item_code: minimum_quantity} pairs from
+        `path` and REPLACES self.stock_rules with them -- lets keep-in-stock
+        targets be tuned by editing a file instead of hardcoding
+        add_stock_rule() calls in main.py. Full replacement (rather than
+        merging/appending) makes this idempotent and safe to call
+        repeatedly: re-running it after the file changes picks up
+        additions, edits, AND removals in one shot, rather than only ever
+        accumulating stale rules for entries someone deleted from the file.
+        Remembers `path` on self._stock_config_path so _stock_config_loop
+        can keep reloading it periodically without the caller re-passing it.
+
+        A missing file is a no-op (first run without a config file present
+        is fine -- keep-in-stock is opt-in). A malformed file (bad JSON, not
+        an object, or a non-int/negative minimum for some code) logs a
+        warning and skips only the bad entries -- never crashes the
+        scheduler over a typo in a hand-edited file.
+        """
+        self._stock_config_path = path
+        p = Path(path)
+        if not p.exists():
+            return
+
+        try:
+            raw = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[TaskEngine] Failed to read stock config '{path}': {e!r}")
+            return
+
+        if not isinstance(raw, dict):
+            print(f"[TaskEngine] Stock config '{path}' must be a JSON object of "
+                  f"{{item_code: minimum}} pairs -- skipping.")
+            return
+
+        new_rules: List[StockRule] = []
+        for code, minimum in raw.items():
+            if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 0:
+                print(f"[TaskEngine] Skipping invalid stock rule '{code}': {minimum!r} "
+                      f"(must be a non-negative integer).")
+                continue
+            new_rules.append(StockRule(code=code, minimum=minimum))
+
+        self.stock_rules = new_rules
+
     def refresh_stock_orders(self) -> None:
         """Bottom-of-the-barrel: only tops up what isn't already covered by
         a live order for that code, and always at KEEP_STOCK tier so it
@@ -229,6 +329,78 @@ class TaskEngine:
                 continue  # already being produced, whatever tier that order is at
             shortfall = rule.minimum - self.held(rule.code)
             self.request_item(rule.code, shortfall, tier=Priority.KEEP_STOCK)
+
+    # ------------------------------------------------------------------
+    # Auto-convert (single-use default-gathered raw materials)
+    # ------------------------------------------------------------------
+
+    def _build_single_use_conversions(self) -> Dict[str, Item]:
+        """One-time (cached) scan of the full item catalog, mapping each
+        default-gathered raw material's code to the single Item that
+        consumes it as a craft ingredient -- but ONLY for raw materials used
+        by exactly one recipe (e.g. copper_ore -> copper_bar, raw_chicken ->
+        cooked_chicken). A raw material feeding two or more different items
+        isn't a 'pure' 1:1 conversion, so it's deliberately excluded: we
+        wouldn't know which of its consumers to auto-craft into. Scanning
+        every item is only done once per run (cached on
+        self._single_use_conversions) rather than on every
+        refresh_auto_convert_orders() tick."""
+        raw_codes = {order.code for order in self.default_orders.values()}
+        consumers: Dict[str, List[Item]] = {}
+        for item in self.db.items.get_all_items_obj():
+            if not item.craft:
+                continue
+            for ing in item.craft.items:
+                if ing.code in raw_codes:
+                    consumers.setdefault(ing.code, []).append(item)
+        return {code: matches[0] for code, matches in consumers.items() if len(matches) == 1}
+
+    def refresh_auto_convert_orders(self) -> None:
+        """Priority.AUTO_CRAFT tier (above DEFAULT busywork, below every real
+        KEEP_STOCK/GATHER/CRAFT/EQUIP request -- see orders.Priority). For
+        every 'pure' single-use default-gathered raw material (see
+        _build_single_use_conversions), automatically queues a craft order
+        to convert whatever SURPLUS currently sits above that raw material's
+        keep-in-stock floor into the finished item -- e.g. only turning
+        copper_ore into copper_bar once there's more copper_ore on hand than
+        we've committed to keeping in stock.
+
+        The floor is the matching StockRule.minimum if one's been
+        registered via add_stock_rule() for that raw material's code,
+        otherwise 100 (per spec: 'or 100 if that isn't set'). Never dips the
+        raw material below that floor, and never creates a second order for
+        the same target item while one is already live (whatever tier it's
+        at) -- avoids re-bumping a target based on ore that's already been
+        earmarked for the in-flight order but hasn't been consumed
+        (crafted) yet, which would otherwise look like fresh surplus on
+        every tick and cause runaway over-ordering. Call periodically (see
+        TaskEngine._auto_convert_loop) -- once an order completes and the
+        raw material's held() total actually drops, the next tick will
+        correctly see less (or no) surplus."""
+        if self._single_use_conversions is None:
+            self._single_use_conversions = self._build_single_use_conversions()
+
+        for raw_code, target_item in self._single_use_conversions.items():
+            if self._order_for_code(target_item.code):
+                continue  # a conversion (or some other request) for this item is already in flight
+
+            rule = next((r for r in self.stock_rules if r.code == raw_code), None)
+            floor = rule.minimum if rule else 100
+
+            spare = self.held(raw_code) - floor
+            if spare <= 0:
+                continue
+
+            ingredient = next((i for i in target_item.craft.items if i.code == raw_code), None)
+            if not ingredient or ingredient.quantity <= 0:
+                continue
+
+            craftable = spare // ingredient.quantity
+            if craftable <= 0:
+                continue
+
+            produced = craftable * max(1, target_item.craft.quantity)
+            self.request_item(target_item.code, produced, tier=Priority.AUTO_CRAFT)
 
     # ------------------------------------------------------------------
     # Default tasks (requirement #5: zero inertia, lowest priority)
@@ -498,16 +670,32 @@ class TaskEngine:
             await self.account.sync_bank()
 
     async def _try_deliver_equipment(self, order: WorkOrder) -> None:
-        """Delivers and equips one unit of order.code to each queued
-        (character, slot) request in order.equip_requests, as bank stock
-        currently allows. Pops off only what it can actually fulfill right
-        now -- if the bank doesn't have enough for everyone yet, whatever's
-        left stays queued for the next call rather than being dropped.
+        """Fulfills each queued (character, slot) request in
+        order.equip_requests, as bank stock currently allows, by sending
+        the recipient to the bank to swap gear there -- NOT by pushing the
+        item out to wherever the character happens to be. For each request
+        this: moves the character to the bank, unequips whatever's
+        currently in that slot (if anything) and deposits it, withdraws one
+        unit of order.code, and equips it. Pops off only what it can
+        actually fulfill right now -- if the bank doesn't have enough for
+        everyone yet, whatever's left stays queued for the next call rather
+        than being dropped.
+
+        Doing the unequip-deposit-withdraw-equip sequence at the bank (in
+        that order) matters: equipping straight over an occupied slot
+        previously failed outright, silently stranding the new item in the
+        character's inventory (and, since something eventually deposits
+        that inventory, right back in the bank) instead of ever getting
+        worn -- gear could sit there indefinitely even though the craft/
+        gather order that produced it looked complete.
+
         Called both right after an order completes (best-effort, immediate)
         and on every tick of _delivery_loop (so recipients who couldn't be
         served at completion time -- e.g. only 1 of 5 requested copies had
         actually landed in the bank yet -- still get theirs once the rest
         of the order's crafting/gathering catches up)."""
+        map_db = self.db.maps
+
         while order.equip_requests:
             bank_qty = next((i.quantity for i in self.account.bank.items if i.code == order.code), 0)
             if bank_qty <= 0:
@@ -519,18 +707,44 @@ class TaskEngine:
                 order.equip_requests.pop(0)
                 continue
 
-            # busy_lock serializes this whole move-withdraw-equip sequence
-            # against `requester`'s own character_loop iteration (see
-            # Character.busy_lock) -- without it, this delivery (running
-            # from the separate _delivery_loop task) could interleave its
-            # moves with a gather/craft step the requester's own loop is
-            # mid-way through, leaving them standing somewhere neither side
-            # expects (spurious 598/490 errors).
+            # busy_lock serializes this whole move-unequip-deposit-withdraw-
+            # equip sequence against `requester`'s own character_loop
+            # iteration (see Character.busy_lock) -- without it, this
+            # delivery (running from the separate _delivery_loop task)
+            # could interleave its moves with a gather/craft step the
+            # requester's own loop is mid-way through, leaving them
+            # standing somewhere neither side expects (spurious 598/490
+            # errors).
             async with requester.busy_lock:
-                await requester.actions.withdraw_items([{"code": order.code, "quantity": 1}])
+                bank_pos = requester.actions.get_closest_bank(map_db)
+                if not bank_pos:
+                    print(f"[{requester.name}] Could not resolve a bank to deliver '{order.code}'.")
+                    break
+                await requester.actions.smart_move(bank_pos, map_db=map_db)
+
+                # Unequip whatever's currently in that slot (if anything)
+                # and deposit it, so the slot is free before we try to put
+                # the new item on -- and the old gear ends up back in the
+                # bank rather than just sitting unequipped in inventory.
+                # Stacked utility slots track their held quantity in a
+                # matching `<slot>_quantity` attribute; other slots don't
+                # have one, so getattr falls back to 1 (a single equipped
+                # item, the normal case).
+                old_code = getattr(requester.equipment, slot, "") or ""
+                if old_code:
+                    old_qty = getattr(requester.equipment, f"{slot}_quantity", 1) or 1
+                    await requester.actions.unequip(slot, quantity=old_qty)
+                    await requester.actions._execute_deposit([{"code": old_code, "quantity": old_qty}])
+
+                await requester.actions._execute_withdraw_items([{"code": order.code, "quantity": 1}])
                 await self.account.sync_bank()
                 await requester.actions.equip(order.code, slot)
-            print(f"[{requester.name}] Equipped '{order.code}' in {slot}.")
+
+            if old_code:
+                print(f"[{requester.name}] Unequipped '{old_code}' from {slot} to the bank, "
+                      f"then equipped '{order.code}'.")
+            else:
+                print(f"[{requester.name}] Equipped '{order.code}' in {slot}.")
             order.equip_requests.pop(0)
 
     async def _run_gather_step(self, character, order: WorkOrder) -> None:
@@ -722,6 +936,47 @@ class TaskEngine:
         await asyncio.gather(*(_clean_slate(c) for c in self.account.characters.values()))
         await self.account.sync_bank()
 
+    async def _auto_convert_loop(self) -> None:
+        """Periodically re-runs refresh_auto_convert_orders() so newly
+        accumulated surplus of single-use gathered raw materials keeps
+        getting picked up over time -- a single startup call (like
+        refresh_stock_orders() gets) would only ever see whatever surplus
+        happened to exist the instant the engine started, which is
+        typically none."""
+        while self.running:
+            try:
+                self.refresh_auto_convert_orders()
+            except Exception as e:
+                # Mirrors _delivery_loop's per-tick guard: one bad tick must
+                # not propagate out of asyncio.gather() in run() and tear
+                # down every character's loop along with it.
+                print(f"[TaskEngine] Error refreshing auto-convert orders: {e!r}")
+            await asyncio.sleep(self.poll_interval)
+
+    async def _stock_config_loop(self) -> None:
+        """Periodically re-reads the file passed to load_stock_rules_from_file
+        (self._stock_config_path) and re-runs refresh_stock_orders(), so
+        edits to that file -- adding, retuning, or removing a keep-in-stock
+        target -- take effect while the engine is running instead of only
+        at startup. No-ops (just sleeps) if load_stock_rules_from_file was
+        never called, so it's harmless to always include this loop in
+        run() regardless of whether file-backed stock rules are in use.
+        Polls far less often than the per-character action loop (file edits
+        are rare; no need to hit disk every poll_interval tick)."""
+        interval = max(self.poll_interval * 10, 10.0)
+        while self.running:
+            if self._stock_config_path:
+                try:
+                    self.load_stock_rules_from_file(self._stock_config_path)
+                    self.refresh_stock_orders()
+                except Exception as e:
+                    # Mirrors _auto_convert_loop/_delivery_loop's per-tick
+                    # guard: one bad reload must not propagate out of
+                    # asyncio.gather() in run() and tear down every
+                    # character's loop along with it.
+                    print(f"[TaskEngine] Error reloading stock config: {e!r}")
+            await asyncio.sleep(interval)
+
     async def _delivery_loop(self) -> None:
         """Periodically sweeps every order for pending equip_requests and
         delivers/equips whatever the bank can currently supply. Decoupled
@@ -749,12 +1004,15 @@ class TaskEngine:
     async def run(self) -> None:
         self.assign_default_gather_tasks()
         self.refresh_stock_orders()
+        self.refresh_auto_convert_orders()
         self.verify()
         self.print_plan_tree()
 
         self.running = True
         loops = [self.character_loop(c) for c in self.account.characters.values()]
         loops.append(self._delivery_loop())
+        loops.append(self._auto_convert_loop())
+        loops.append(self._stock_config_loop())
         await asyncio.gather(*loops)
 
     def stop(self) -> None:

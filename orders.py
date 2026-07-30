@@ -27,15 +27,34 @@ class OrderKind(IntEnum):
 
 
 class Priority(IntEnum):
-    """Scheduling tier. Fixed ordering per spec: Crafting > Gathering >
-    Keep-in-stock > Default. Assigned per-order (not derived solely from
-    `kind`), so e.g. a craft order created only to satisfy a keep-in-stock
-    rule is deliberately downgraded to KEEP_STOCK and can be outranked by a
-    genuine GATHER request."""
+    """Scheduling tier. Fixed ordering per spec: Equip > Crafting > Gathering
+    > Keep-in-stock > Auto-convert > Default. Assigned per-order (not derived
+    solely from `kind`), so e.g. a craft order created only to satisfy a
+    keep-in-stock rule is deliberately downgraded to KEEP_STOCK and can be
+    outranked by a genuine GATHER request.
+
+    EQUIP sits above CRAFT (and above CRAFT + INERTIA_BONUS, so it always
+    wins the inertia comparison in TaskEngine.select_order_for too) because
+    an equip request is a character explicitly waiting on gear that's ready
+    -- see TaskEngine.request_equipment(), which forces this tier across
+    the whole craft/gather expansion chain (not just the top-level order)
+    so getting someone equipped interrupts whatever they were doing rather
+    than queueing behind it.
+
+    AUTO_CRAFT sits just above DEFAULT (busywork) and just below KEEP_STOCK:
+    it's for automatically converting surplus of a "pure" single-use
+    default-gathered raw material (one that's only ever an ingredient in
+    exactly one recipe -- e.g. copper_ore -> copper_bar, raw_chicken ->
+    cooked_chicken) into its finished item. It must never outrank an actual
+    keep-in-stock or gather/craft request for that same raw material, but it
+    should still preempt characters who'd otherwise be sitting on DEFAULT
+    busywork. See TaskEngine.refresh_auto_convert_orders()."""
     DEFAULT = 0
+    AUTO_CRAFT = 5
     KEEP_STOCK = 10
     GATHER = 20
     CRAFT = 30
+    EQUIP = 40
 
 
 # Effective-priority bonus given to whatever order a character is CURRENTLY
