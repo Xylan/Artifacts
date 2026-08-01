@@ -175,6 +175,18 @@ class Character:
         # call, which re-acquires action_lock itself.
         self.busy_lock = asyncio.Lock()
 
+        # Event-driven idle signal (TODO task 5): Scheduler.character_loop
+        # awaits this instead of unconditionally sleeping `poll_interval`
+        # while idle. Scheduler subscribes to OrderCreated/OrderUpdated/
+        # OrderCompleted/OrderReleased on engine.bus and calls `.set()` on
+        # whichever characters' events are relevant (or, for OrderCompleted,
+        # on everyone -- see Scheduler._wake_eligible/_wake_all) whenever
+        # something appears that this character could plausibly now act on.
+        # character_loop clears it right after waking so the next wait()
+        # blocks again until the next real change, rather than firing
+        # immediately forever after the first set().
+        self.work_available = asyncio.Event()
+
         # Complex / Grouped Sub-Models
         self.skills = Skills(
             mining_level=data["mining_level"],
@@ -392,14 +404,15 @@ class Character:
         return self.location.position.x == target_x and self.location.position.y == target_y
 
     def __getstate__(self):
-        """Prevents Spyder/pickle from crashing on the non-picklable asyncio.Lock
-        (self.actions already nulls its own api reference via its own
-        __getstate__). A fresh lock is recreated on unpickle -- lock identity
-        doesn't need to survive a pickle round-trip, only its serializing
-        behavior within a running process."""
+        """Prevents Spyder/pickle from crashing on the non-picklable asyncio.Lock/
+        asyncio.Event objects (self.actions already nulls its own api
+        reference via its own __getstate__). A fresh lock/event is recreated
+        on unpickle -- identity doesn't need to survive a pickle round-trip,
+        only serializing behavior within a running process."""
         state = self.__dict__.copy()
         state["action_lock"] = None
         state["busy_lock"] = None
+        state["work_available"] = None
         return state
 
     def __setstate__(self, state):
@@ -408,6 +421,8 @@ class Character:
             self.action_lock = asyncio.Lock()
         if self.__dict__.get("busy_lock") is None:
             self.busy_lock = asyncio.Lock()
+        if self.__dict__.get("work_available") is None:
+            self.work_available = asyncio.Event()
 
     def __getattr__(self, name: str) -> Any:
         """Only invoked when normal attribute lookup fails (so it never

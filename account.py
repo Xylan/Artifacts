@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from character import Character
+from events import BankSynced, EventBus
 from models import InventoryItem, Event, parse_reset
 
 
@@ -248,6 +249,14 @@ class Account:
         self.active_events: List[Event] = []
         self.characters: Dict[str, Character] = {}
 
+        # Optional event bus (events.py). Account is constructed (and its
+        # first sync() called) in main.py BEFORE TaskEngine/its EventBus
+        # exist, so this starts as None and is late-bound via set_bus() once
+        # the engine is built -- mirrors set_map_db()'s late-binding pattern
+        # below. sync_bank()/sync_pending_items() no-op the emit if it's
+        # still None (e.g. the pre-engine sync() call in main.py).
+        self.bus: Optional[EventBus] = None
+
     def __getstate__(self):
         """Prevents Spyder/pickle from crashing on the non-picklable api client.
         self.actions (CharacterActions) and each Character's own .actions
@@ -265,6 +274,12 @@ class Account:
         self.map_db = map_db
         for character in self.characters.values():
             character.actions.map_db = map_db
+
+    def set_bus(self, bus: EventBus) -> None:
+        """Late-binds the engine's EventBus (see the __init__ comment on
+        self.bus for why this can't just be a constructor arg). Called once
+        by TaskEngine.__init__ right after it builds self.bus."""
+        self.bus = bus
 
     @property
     def rate_limiter(self) -> RateLimiter:
@@ -299,6 +314,12 @@ class Account:
             page += 1
         self.bank.items = items
 
+        # TODO task 6: the trigger _delivery_loop/_auto_convert_loop react
+        # to instead of polling on a timer. No-ops before the engine (and
+        # therefore its bus) exists -- see the self.bus comment in __init__.
+        if self.bus is not None:
+            self.bus.emit(BankSynced())
+
     async def sync_pending_items(self) -> None:
         pending: List[PendingItem] = []
         page = 1
@@ -310,6 +331,15 @@ class Account:
                 break
             page += 1
         self.pending_items = pending
+
+        # Also treat a pending-items refresh as a BankSynced trigger: the
+        # only way pending items actually change bank/inventory state is via
+        # claim_item, which callers run separately, so this alone rarely
+        # unblocks a delivery -- but it's a cheap, harmless nudge for any
+        # subscriber that only cares "has account state possibly changed"
+        # (TODO task 6, marked optional there).
+        if self.bus is not None:
+            self.bus.emit(BankSynced())
 
     async def sync_active_events(self) -> None:
         """Refreshes currently-live world events (bonus nodes, invasions,

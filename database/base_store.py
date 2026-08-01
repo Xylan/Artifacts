@@ -67,7 +67,26 @@ class BaseStore:
         self.set_metadata(key, timestamp, conn=conn)
 
     def is_cache_expired(self, last_updated_key: str) -> bool:
-        """Unified check to determine if the local cache is empty or has exceeded the TTL duration."""
+        """Unified check to determine if the local cache is empty or has exceeded the TTL duration.
+
+        TODO task 11 audit decision: left as time-based TTL, deliberately NOT
+        converted to event-driven invalidation. This gates ItemStore/
+        MonsterStore/ResourceStore/MapStore, which cache the game's static
+        content catalogs (item/monster/resource/map definitions) -- data that
+        only changes when the game itself patches, not in response to
+        anything this engine's event bus (events.py) models. It's called
+        exactly once per process, at startup, via GameDatabase.sync_all()
+        (main.py); no loop re-checks it while the engine runs. There is no
+        live domain event (OrderCompleted, BankSynced, etc.) that plausibly
+        means "the item catalog changed upstream" -- unlike the four polling
+        sites this TODO converts (character idling, order delivery,
+        auto-convert, stock-config reload), which were all re-deriving live
+        *engine* state that genuinely changes every tick. Making this
+        event-driven would have nothing meaningful to subscribe to; the
+        24h TTL + cold-cache-path (`count() == 0`) check is the right shape
+        for "static reference data, refreshed occasionally." Revisit only if
+        a future feature needs live game-content patch detection.
+        """
         if self.count() == 0:
             return True
         last_updated = self.get_last_updated(last_updated_key)

@@ -14,9 +14,46 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Protocol, Set, Tuple, runtime_checkable
 
 _id_counter = itertools.count(1)
+
+
+@runtime_checkable
+class SchedulableOrder(Protocol):
+    """Structural (duck-typed) common shape shared by WorkOrder (below) and
+    models.PlanTask -- the two representations of "gather/craft N of item X"
+    used by task_runner.TaskEngine and planning.PlanRunner respectively.
+
+    This is the "single polymorphic Order class" consolidation called for in
+    the refactor notes, implemented as a Protocol rather than a shared base
+    dataclass on purpose: WorkOrder and PlanTask are persisted/compared very
+    differently -- WorkOrder is transient, in-memory-only, and tracks live
+    claim/lock state for concurrent characters (locked_to, claimed_by,
+    equip_requests); PlanTask is serialized row-for-row into
+    database.TaskStore and tracks a static dependency DAG (depends_on,
+    assigned_to, status). Forcing them onto one dataclass would mean either
+    dragging TaskEngine-only fields into every persisted PlanTask row, or
+    dragging PlanTask-only fields into every live WorkOrder -- neither is a
+    real simplification, and PlanTask's on-disk schema (TaskStore) would
+    have to migrate for no behavioral gain. A Protocol instead lets any code
+    that only cares about the shared "what item, how much, via what
+    skill/node" shape (e.g. a future shared verify()/summary() helper)
+    accept either type interchangeably, without touching either class's
+    persistence or concurrency model. Both already satisfy this shape
+    field-for-field with no changes required (see PlanTask in models.py) --
+    that's what made it worth pulling out at all.
+
+    Note: models.Task (also in models.py) is a different, unrelated concept
+    -- a read-only view over the Artifacts API's own task-board fields on a
+    live Character (character.current_task) -- and does NOT implement this
+    protocol; it isn't one of "our" schedulable orders."""
+    code: str
+    node_code: str
+    skill: str
+    skill_level: int
+    target_quantity: int
+    produces_per_action: int
 
 
 class OrderKind(IntEnum):
@@ -92,6 +129,17 @@ class WorkOrder:
     locked_to: Optional[str] = None       # CRAFT only: character holding the exclusive claim
     claimed_by: Set[str] = field(default_factory=set)   # GATHER: characters currently working it
     done: bool = False
+    # Non-blocking re-entrancy guard for executor.Executor._try_deliver_equipment
+    # (TODO task 12): delivery can now be reached concurrently from several
+    # independent triggers for the SAME order (EquipmentRequested/BankSynced
+    # bus subscribers, the safety-sweep loop, AND a direct call from
+    # _run_gather_step/_run_craft_step) -- this flag serializes actual work
+    # on the order's equip_requests queue to at most one caller at a time.
+    # Deliberately a plain bool, not an asyncio.Lock: a losing concurrent
+    # call is meant to return immediately rather than block, since blocking
+    # here can deadlock against a character's busy_lock -- see
+    # Executor._try_deliver_equipment's docstring for the full reasoning.
+    _delivering: bool = field(default=False, repr=False)
 
     @property
     def base_priority(self) -> int:

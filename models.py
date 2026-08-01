@@ -212,6 +212,11 @@ class PlanTask:
     so a plan can be built, persisted (TaskStore), and handed to any
     character roster at execution time.
 
+    Structurally satisfies orders.SchedulableOrder (code, node_code, skill,
+    skill_level, target_quantity, produces_per_action) -- see that
+    Protocol's docstring for why this and orders.WorkOrder are kept as two
+    classes rather than merged into one.
+
     `target_quantity` is the total amount of `code` that needs to exist
     across all characters' inventories + the bank; PlanRunner loops the
     matching action until that target is met rather than running a fixed
