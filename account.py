@@ -4,10 +4,8 @@
 Account: live/volatile account-level state, shared across every character on
 the account -- rate limit windows, bank contents, pending items, active world
 events, and account details (membership, gems, badges). Also the home for the
-character roster: Account owns the one shared CharacterActions instance and
-attaches a bound `.actions` to each Character it builds, so callers can do
-`xylan.actions.rest()` (or `xylan.rest()` via Character's __getattr__ fallback)
-instead of threading `actions`/`character` through everywhere by hand.
+character roster: Account builds each Character (which owns its own actions
+as plain methods, e.g. `xylan.rest()`) and keeps them in self.characters.
 
 Unlike database/*Store, this is NOT TTL-cached; it reflects the live state of
 the account and should be re-synced whenever it's read for anything
@@ -237,8 +235,7 @@ class Account:
     """Top-level container: live account state + the character roster.
     One Account per API token/process. Characters live here rather than as
     a loose list in main.py, since they share this account's bank, pending
-    items, rate-limit budget -- and now also a single CharacterActions
-    instance, bound onto each character as `.actions`."""
+    items, and rate-limit budget."""
 
     def __init__(self, api, map_db=None):
         self.api = api
@@ -259,8 +256,8 @@ class Account:
 
     def __getstate__(self):
         """Prevents Spyder/pickle from crashing on the non-picklable api client.
-        self.actions (CharacterActions) and each Character's own .actions
-        already null their own api reference via their own __getstate__."""
+        Each Character already nulls its own api reference via its own
+        __getstate__."""
         state = self.__dict__.copy()
         state["api"] = None
         return state
@@ -273,7 +270,7 @@ class Account:
         Updates it here and propagates to every character already built."""
         self.map_db = map_db
         for character in self.characters.values():
-            character.actions.map_db = map_db
+            character.map_db = map_db
 
     def set_bus(self, bus: EventBus) -> None:
         """Late-binds the engine's EventBus (see the __init__ comment on
@@ -314,9 +311,10 @@ class Account:
             page += 1
         self.bank.items = items
 
-        # TODO task 6: the trigger _delivery_loop/_auto_convert_loop react
-        # to instead of polling on a timer. No-ops before the engine (and
-        # therefore its bus) exists -- see the self.bus comment in __init__.
+        # Notifies bus subscribers (e.g. Executor's delivery handler,
+        # OrderManager's stock/auto-convert checks) that bank state may have
+        # changed. No-ops before the engine (and therefore its bus) exists --
+        # see the self.bus comment in __init__.
         if self.bus is not None:
             self.bus.emit(BankSynced())
 
@@ -336,8 +334,7 @@ class Account:
         # only way pending items actually change bank/inventory state is via
         # claim_item, which callers run separately, so this alone rarely
         # unblocks a delivery -- but it's a cheap, harmless nudge for any
-        # subscriber that only cares "has account state possibly changed"
-        # (TODO task 6, marked optional there).
+        # subscriber that only cares "has account state possibly changed".
         if self.bus is not None:
             self.bus.emit(BankSynced())
 

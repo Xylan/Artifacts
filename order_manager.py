@@ -3,15 +3,13 @@
 """
 order_manager.py: Order *creation* and *bookkeeping* for task_runner.TaskEngine.
 
-Split out of task_runner.py (formerly a "God module") per the module
-boundary described there: this file owns everything about deciding WHAT
-work should exist --
+Owns everything about deciding WHAT work should exist:
 
   * request_item / _bump_ingredients / request_equipment / request_upgrades_for
     -- turning "I want N of code X" into CRAFT/GATHER WorkOrders, recursively
     expanding craft ingredients.
   * Keep-in-stock rules (add_stock_rule, refresh_stock_orders) -- NOTE the
-    *file-backed* loader (load_stock_rules_from_file) has moved to
+    *file-backed* loader (load_stock_rules_from_file) lives in
     config_watcher.py; this module only owns the StockRule list and turning
     a rule into a live order once holdings dip below its minimum.
   * Auto-convert (_build_single_use_conversions, refresh_auto_convert_orders)
@@ -25,9 +23,10 @@ It does NOT decide who works an order, when, or how (that's scheduler.py /
 executor.py) -- it only creates, sizes, and tears down orders. All state
 (self.engine.orders, self.engine.stock_rules, self.engine.default_orders)
 lives on the shared TaskEngine instance passed in at construction; this
-class is a thin, statelessly-reusable operator over that shared state,
-mirroring executor.py/scheduler.py/config_watcher.py's pattern so every
-piece of the old task_runner.py can be understood/tested in isolation.
+class is a thin operator over that shared state.
+
+For why this module is shaped this way (the God-module split, the
+event-bus conversion, the concurrency-audit fixes), see ARCHITECTURE.md.
 """
 from __future__ import annotations
 
@@ -38,7 +37,7 @@ from events import (
     BankSynced, EquipmentRequested, OrderCompleted, OrderCreated, OrderUpdated,
     StockBelowMinimum,
 )
-from models import Item
+from models import Item, find_quantity
 from orders import WorkOrder, OrderKind, Priority
 from roles import GATHER_SKILLS
 
@@ -63,37 +62,19 @@ class OrderManager:
     def __init__(self, engine: "TaskEngine"):
         self.engine = engine
 
-        # Reactive auto-convert (TODO task 8), replacing
-        # TaskEngine._auto_convert_loop's old "re-scan every single-use
-        # conversion candidate, every tick" poll. Same pattern as
-        # Executor.__init__'s EquipmentRequested/BankSynced subscriptions:
-        #   * OrderCompleted tells us exactly which code just finished --
-        #     if a GATHER order for a raw material completes, that's new
-        #     supply that might now clear a conversion's surplus floor, so
-        #     _on_order_completed narrows straight to that one raw code via
-        #     _maybe_auto_convert rather than re-checking every candidate.
-        #   * BankSynced doesn't carry which code changed, so the best we
-        #     can do without over/under-scoping is the same bounded sweep
-        #     refresh_auto_convert_orders always did -- it only ever
-        #     iterates the cached single_use_conversions dict (a handful of
-        #     entries), never "everything," so reusing it here isn't a
-        #     regression to full-pool scanning.
-        # Reactive keep-in-stock threshold detection (TODO task 10),
-        # replacing refresh_stock_orders()'s old "only ever runs at
-        # startup or on a config reload" cadence. OrderCompleted and
-        # BankSynced are exactly the two events that already fire at every
-        # point the TODO calls out (deposits, gathers completing, crafts
-        # completing all route through Executor's deposit-then-sync_bank
-        # calls, which emit BankSynced; gathers/crafts finishing also emit
-        # OrderCompleted) -- no new emission points needed elsewhere.
-        # _check_stock_thresholds is the *detector* (bounded to
-        # engine.stock_rules, emits StockBelowMinimum for anything under
-        # its floor); _on_stock_below_minimum is refresh_stock_orders'
-        # *reaction* to that event, narrowed to just the one code named by
-        # the event rather than re-sweeping every rule.
+        # Auto-convert reacts to OrderCompleted (narrows to the one
+        # completed code via _maybe_auto_convert) and BankSynced (which
+        # carries no code, so it re-runs the bounded
+        # refresh_auto_convert_orders sweep instead). Keep-in-stock
+        # threshold detection follows the same shape: _check_stock_thresholds
+        # (the detector, bounded to engine.stock_rules) is subscribed to
+        # both events too, and emits StockBelowMinimum for anything under
+        # its floor; _on_stock_below_minimum is the reaction, narrowed to
+        # just the one code named by the event. See ARCHITECTURE.md for why
+        # these two events cover every point a shortfall/surplus can appear.
         #
-        # Subscriptions are tracked in self._subscriptions (TODO task 12) so
-        # close() can unsubscribe them all -- see that method.
+        # Subscriptions are tracked in self._subscriptions so close() can
+        # unsubscribe them all -- see that method.
         self._subscriptions = [
             (OrderCompleted, self.engine.bus.subscribe(OrderCompleted, self._on_order_completed)),
             (BankSynced, self.engine.bus.subscribe(BankSynced, self._on_bank_synced)),
@@ -104,13 +85,10 @@ class OrderManager:
 
     def close(self) -> None:
         """Unsubscribes every handler this instance registered on
-        engine.bus (TODO task 12: subscriber cleanup on TaskEngine.stop()).
-        Idempotent -- see Executor.close()'s matching docstring. Note this
-        subscribes _check_stock_thresholds to BOTH OrderCompleted and
-        BankSynced as two separate registrations (see __init__) -- both are
-        unsubscribed here, each keyed by its own (event_type, handler)
-        pair, so EventBus.unsubscribe's list.remove() targets the right
-        one."""
+        engine.bus. Called by TaskEngine.stop(); idempotent. Note
+        _check_stock_thresholds is subscribed to BOTH OrderCompleted and
+        BankSynced as two separate registrations (see __init__), each
+        unsubscribed here by its own (event_type, handler) pair."""
         for event_type, handler in self._subscriptions:
             self.engine.bus.unsubscribe(event_type, handler)
 
@@ -132,16 +110,13 @@ class OrderManager:
         ingredients) as needed.
 
         `tier=None` (the default) gives each generated order its "natural"
-        priority: CRAFT for craftable items, GATHER for gatherable ones --
-        per the Crafting > Gathering rule. Passing tier=Priority.KEEP_STOCK
-        (or DEFAULT) instead forces that single tier across the whole
-        expansion, so a keep-in-stock request never jumps ahead of a
-        genuine equipment/gather request even if it happens to be craftable.
-        request_equipment() below instead forces tier=Priority.EQUIP across
-        the whole expansion (top-level order AND every recursive ingredient
-        order), so an equip request -- craft step, gather steps, all of it --
-        outranks and interrupts ordinary CRAFT/GATHER work rather than just
-        matching its natural tier and waiting in line behind it.
+        priority: CRAFT for craftable items, GATHER for gatherable ones.
+        Passing tier=Priority.KEEP_STOCK (or DEFAULT) instead forces that
+        single tier across the whole expansion, so a keep-in-stock request
+        never jumps ahead of a genuine equipment/gather request even if it
+        happens to be craftable. request_equipment() below instead forces
+        tier=Priority.EQUIP across the whole expansion, so an equip request
+        outranks and interrupts ordinary CRAFT/GATHER work.
 
         Returns the id of the top-level order for `code`, or None if `code`
         is neither craftable nor gatherable (buy it manually). Safe to call
@@ -152,11 +127,8 @@ class OrderManager:
         `engine.bus` (a fresh order -> OrderCreated, bumping an existing
         one's target_quantity -> OrderUpdated), plus EquipmentRequested
         whenever a `requester`/`equip_slot` pair is queued. Every other
-        OrderManager method that creates/bumps orders (_bump_ingredients,
-        request_equipment, refresh_stock_orders, refresh_auto_convert_orders)
-        funnels through here rather than emitting anything itself, so a
-        subscriber only ever needs to listen in one place to hear about
-        every order change regardless of which caller triggered it.
+        OrderManager method that creates/bumps orders funnels through here
+        rather than emitting anything itself.
         """
         engine = self.engine
         if quantity <= 0:
@@ -168,10 +140,9 @@ class OrderManager:
             if existing.kind == OrderKind.CRAFT:
                 self._bump_ingredients(existing, quantity, tier)
             if requester and equip_slot:
-                # Queue this recipient too, rather than only ever honoring
-                # the first character who ever requested `code` -- multiple
-                # characters wanting the same upgrade is the common case
-                # (request_upgrades_for is called once per character).
+                # Queue this recipient too, rather than only honoring the
+                # first character who requested `code` -- multiple
+                # characters wanting the same upgrade is common.
                 existing.equip_requests.extend([(requester, equip_slot)] * quantity)
                 engine.bus.emit(EquipmentRequested(
                     order_id=existing.id, character_name=requester, code=code, slot=equip_slot,
@@ -185,24 +156,14 @@ class OrderManager:
             ))
             return existing.id
 
-        # Check the bank before spinning up a new craft/gather order -- if
-        # `code` is already sitting in the bank in sufficient quantity,
-        # there's nothing left to produce. Previously a new order was
-        # created unconditionally here: since select_order_for() already
-        # refuses to hand out any order whose target is <= held() (bank +
-        # inventories), an order that was fully covered by existing bank
-        # stock the moment it was created would never get claimed/worked by
-        # anyone -- but it also never ran through complete() (that only
-        # fires at the end of _run_craft_step/_run_gather_step), so it just
-        # sat in self.orders forever showing up as a "live" craft/gather
-        # request for an item that, in practice, was already finished, and
-        # any equip_requests attached to it never got delivered. Marking it
-        # done immediately when the bank already covers it fixes both: the
-        # order stops looking like unfinished work, and delivery (which
-        # only cares about equip_requests, not order.done) proceeds right
-        # away instead of waiting on a completion event that was never
-        # going to happen.
-        bank_qty = next((i.quantity for i in engine.account.bank.items if i.code == code), 0)
+        # If `code` is already in the bank in sufficient quantity, mark the
+        # new order done immediately (via engine.complete() below) instead
+        # of leaving it live and unclaimed -- select_order_for() never
+        # hands out an order whose target is already covered by held()
+        # (bank + inventories), so an uncompleted order like that would
+        # otherwise sit forever looking like unfinished work, and any
+        # equip_requests attached to it would never get delivered.
+        bank_qty = find_quantity(engine.account.bank.items, code)
         equip_requests = [(requester, equip_slot)] * quantity if requester and equip_slot else []
 
         item = engine.db.items.get_item_obj(code)
@@ -217,15 +178,7 @@ class OrderManager:
                 produces_per_action=produces, parent_id=parent_id,
                 equip_requests=equip_requests,
             )
-            engine.orders[order.id] = order
-            engine.bus.emit(OrderCreated(
-                order_id=order.id, code=order.code, kind=order.kind,
-                priority=order.priority, target_quantity=order.target_quantity,
-            ))
-            if requester and equip_slot:
-                engine.bus.emit(EquipmentRequested(
-                    order_id=order.id, character_name=requester, code=code, slot=equip_slot,
-                ))
+            self._finalize_new_order(order, requester, equip_slot, code)
             if bank_qty >= quantity:
                 engine.complete(order)
             else:
@@ -245,15 +198,7 @@ class OrderManager:
                 produces_per_action=int(avg_yield), parent_id=parent_id,
                 equip_requests=equip_requests,
             )
-            engine.orders[order.id] = order
-            engine.bus.emit(OrderCreated(
-                order_id=order.id, code=order.code, kind=order.kind,
-                priority=order.priority, target_quantity=order.target_quantity,
-            ))
-            if requester and equip_slot:
-                engine.bus.emit(EquipmentRequested(
-                    order_id=order.id, character_name=requester, code=code, slot=equip_slot,
-                ))
+            self._finalize_new_order(order, requester, equip_slot, code)
             if bank_qty >= quantity:
                 engine.complete(order)
             return order.id
@@ -261,10 +206,30 @@ class OrderManager:
         print(f"[OrderManager] '{code}' is neither craftable nor gatherable -- skipping (buy/GE manually).")
         return None
 
+    def _finalize_new_order(
+        self, order: WorkOrder, requester: Optional[str], equip_slot: Optional[str], code: str,
+    ) -> None:
+        """Shared tail of request_item's CRAFT and GATHER branches: inserts
+        the freshly-built `order` into engine.orders and emits OrderCreated,
+        plus EquipmentRequested if a requester/equip_slot pair was given.
+        Does not decide completion -- callers still check bank_qty and
+        expand ingredients (CRAFT only) themselves, since that differs
+        between the two branches."""
+        engine = self.engine
+        engine.orders[order.id] = order
+        engine.bus.emit(OrderCreated(
+            order_id=order.id, code=order.code, kind=order.kind,
+            priority=order.priority, target_quantity=order.target_quantity,
+        ))
+        if requester and equip_slot:
+            engine.bus.emit(EquipmentRequested(
+                order_id=order.id, character_name=requester, code=code, slot=equip_slot,
+            ))
+
     def _bump_ingredients(self, craft_order: WorkOrder, extra_output: int, tier: Optional[Priority]) -> None:
-        """No event emission of its own -- every ingredient bump/creation
-        below routes back through request_item(), which is the single
-        place OrderCreated/OrderUpdated get emitted (see its docstring)."""
+        """Cascades a target bump down to a craft order's ingredient
+        orders. Emits nothing directly -- routes back through
+        request_item(), which owns all order-change emissions."""
         item = self.engine.db.items.get_item_obj(craft_order.code)
         if not item or not item.craft:
             return
@@ -277,16 +242,11 @@ class OrderManager:
         delivered from the bank and equipped once the order completes --
         see executor.Executor._try_deliver_equipment(). Forces
         Priority.EQUIP across the entire craft/gather expansion (the
-        top-level order for `code` and every recursive ingredient order
-        request_item() spins up for it), not just the top-level order -- an
-        equip request is meant to interrupt whatever a character is
-        currently doing, and that only works end-to-end if the
-        ingredient-gathering/crafting steps feeding it also outrank
-        ordinary CRAFT/GATHER work along the way, not just the final craft
-        step. Like _bump_ingredients, emits nothing directly -- request_item
-        (and its recursive ingredient calls) is where OrderCreated/
-        OrderUpdated/EquipmentRequested all fire, so every EQUIP-tier order
-        this expands into is covered."""
+        top-level order for `code` and every recursive ingredient order),
+        so an equip request interrupts and outranks ordinary CRAFT/GATHER
+        work at every step, not just the final craft. Emits nothing
+        directly -- routes through request_item(), same as
+        _bump_ingredients."""
         return self.request_item(code, quantity, tier=Priority.EQUIP, requester=character_name, equip_slot=slot)
 
     def request_upgrades_for(self, character) -> List[int]:
@@ -315,30 +275,24 @@ class OrderManager:
         self.engine.stock_rules.append(StockRule(code=code, minimum=minimum))
 
     def refresh_stock_orders(self) -> None:
-        """Bottom-of-the-barrel: only tops up what isn't already covered by
-        a live order for that code, and always at KEEP_STOCK tier so it
-        never outranks a genuine gather/craft request. Called at startup
-        (TaskEngine.run), reactively on ConfigChanged
-        (ConfigWatcher._on_config_changed), and now also -- per rule, not as
-        a full re-sweep -- via _on_stock_below_minimum below (TODO task 10).
-        Bounded to engine.stock_rules (a handful of entries), never the
-        whole order pool. Emits nothing directly -- _maybe_queue_stock_order
-        (and, inside it, request_item()) is what fires OrderCreated/
-        OrderUpdated for any KEEP_STOCK order this creates."""
+        """Full sweep over engine.stock_rules: tops up anything not already
+        covered by a live order for that code, always at KEEP_STOCK tier so
+        it never outranks a genuine gather/craft request. Called at startup
+        (TaskEngine.run) and reactively on ConfigChanged
+        (ConfigWatcher._on_config_changed); per-code shortfalls are also
+        caught without a full re-sweep via _on_stock_below_minimum below.
+        Bounded to engine.stock_rules, never the whole order pool. Emits
+        nothing directly -- _maybe_queue_stock_order does."""
         engine = self.engine
         for rule in engine.stock_rules:
             self._maybe_queue_stock_order(rule.code, rule.minimum)
 
     def _maybe_queue_stock_order(self, code: str, minimum: int) -> None:
-        """Per-code keep-in-stock logic (TODO task 10, extracted from
-        refresh_stock_orders so a single code can be topped up without
-        re-sweeping every other stock rule -- mirrors how
-        _maybe_auto_convert was pulled out of refresh_auto_convert_orders
-        for task 8). No-ops if `code` is already at/above `minimum`, or if
-        a live order for it already exists (whatever tier that order is
-        at) -- both checks make repeated calls for the same shortfall
-        idempotent, which matters since _on_stock_below_minimum can fire
-        once per BankSynced/OrderCompleted while the shortfall persists."""
+        """Per-code keep-in-stock logic, extracted so a single code can be
+        topped up without re-sweeping every other stock rule. No-ops if
+        `code` is already at/above `minimum`, or if a live order for it
+        already exists (whatever tier) -- both checks make repeated calls
+        for the same shortfall idempotent."""
         engine = self.engine
         current = engine.held(code)
         if current - minimum >= 0:
@@ -373,14 +327,12 @@ class OrderManager:
 
     def refresh_auto_convert_orders(self) -> None:
         """Full sweep over every 'pure' single-use conversion candidate (see
-        _build_single_use_conversions) -- bounded to that cached dict (a
-        handful of entries), never the whole order pool. This is now the
-        BankSynced reactive path (see _on_bank_synced below) plus
-        TaskEngine._auto_convert_safety_sweep_loop's much-lower-frequency
-        backstop (TODO task 8); startup (TaskEngine.run) still calls it once
-        up front too. Per-candidate logic lives in _maybe_auto_convert so
-        OrderCompleted can react to a single just-finished raw material
-        without re-checking every other candidate."""
+        _build_single_use_conversions) -- bounded to that cached dict, never
+        the whole order pool. Runs on the BankSynced reactive path (see
+        _on_bank_synced below), on TaskEngine's low-frequency safety-sweep
+        backstop, and once at startup (TaskEngine.run). Per-candidate logic
+        lives in _maybe_auto_convert so a reactive handler can react to a
+        single code without re-checking every other candidate."""
         engine = self.engine
         if engine._single_use_conversions is None:
             engine._single_use_conversions = self._build_single_use_conversions()
@@ -389,26 +341,20 @@ class OrderManager:
             self._maybe_auto_convert(raw_code)
 
     def _maybe_auto_convert(self, raw_code: str) -> None:
-        """Priority.AUTO_CRAFT tier (above DEFAULT busywork, below every real
-        KEEP_STOCK/GATHER/CRAFT/EQUIP request -- see orders.Priority). If
-        `raw_code` is a 'pure' single-use default-gathered raw material (see
-        _build_single_use_conversions), queues a craft order to convert
-        whatever SURPLUS currently sits above that raw material's
-        keep-in-stock floor into the finished item -- e.g. only turning
-        copper_ore into copper_bar once there's more copper_ore on hand than
-        we've committed to keeping in stock.
+        """If `raw_code` is a 'pure' single-use default-gathered raw
+        material (see _build_single_use_conversions), queues a
+        Priority.AUTO_CRAFT order to convert whatever SURPLUS currently
+        sits above that raw material's keep-in-stock floor into the
+        finished item -- e.g. only turning copper_ore into copper_bar once
+        there's more copper_ore on hand than committed to keeping in stock.
 
-        The floor is the matching StockRule.minimum if one's been
-        registered via add_stock_rule() for that raw material's code,
-        otherwise 100 (per spec: 'or 100 if that isn't set'). Never dips the
-        raw material below that floor, and never creates a second order for
-        the same target item while one is already live (whatever tier it's
-        at). Emits nothing directly -- the request_item() call below is
-        what fires OrderCreated/OrderUpdated for any AUTO_CRAFT order this
-        creates. No-op (silently) if `raw_code` isn't a known single-use
-        conversion candidate at all -- lets callers like
-        _on_order_completed pass any completed order's code through
-        unconditionally rather than pre-filtering."""
+        The floor is the matching StockRule.minimum if registered via
+        add_stock_rule(), otherwise 100. Never dips the raw material below
+        that floor, and never creates a second order for the same target
+        item while one is already live. Emits nothing directly -- routes
+        through request_item(). Silently no-ops if `raw_code` isn't a known
+        conversion candidate, so callers like _on_order_completed can pass
+        any code through unconditionally."""
         engine = self.engine
         if engine._single_use_conversions is None:
             engine._single_use_conversions = self._build_single_use_conversions()
@@ -439,53 +385,35 @@ class OrderManager:
         self.request_item(target_item.code, produced, tier=Priority.AUTO_CRAFT)
 
     async def _on_order_completed(self, event: OrderCompleted) -> None:
-        """React to a single order finishing -- if it was a GATHER order for
-        a raw material that's a single-use conversion candidate, that's
-        fresh supply that might newly clear the conversion's surplus floor,
-        so check just that one code (TODO task 8) instead of re-scanning
-        every candidate. _maybe_auto_convert no-ops harmlessly for any
-        completed order whose code isn't a conversion candidate (e.g. a
-        CRAFT order, or a GATHER order for something with no single-use
-        consumer), so no pre-filtering is needed here."""
+        """Checks just the one completed order's code for a possible
+        auto-convert opportunity, rather than re-scanning every candidate.
+        _maybe_auto_convert no-ops harmlessly for a code that isn't a
+        conversion candidate."""
         self._maybe_auto_convert(event.code)
 
     async def _on_bank_synced(self, event: BankSynced) -> None:
-        """React to bank contents changing by re-running the full (but
-        bounded -- see refresh_auto_convert_orders) sweep over every
-        single-use conversion candidate: BankSynced doesn't say *which*
-        item changed, so this can't narrow further than that, but it's
-        still scoped to just the cached conversion candidates, never the
-        whole order pool."""
+        """BankSynced doesn't say which code changed, so this re-runs the
+        full (but still bounded) refresh_auto_convert_orders sweep."""
         self.refresh_auto_convert_orders()
 
     # ------------------------------------------------------------------
-    # Keep-in-stock threshold detection (TODO task 10, reactive)
+    # Keep-in-stock threshold detection
     # ------------------------------------------------------------------
 
     def _check_stock_thresholds(self, event: Optional[object] = None) -> None:
-        """Detector half of TODO task 10: bounded sweep over
-        engine.stock_rules (never the whole order pool -- same bound
-        refresh_stock_orders itself always used) that emits
-        StockBelowMinimum for every tracked code currently sitting under
-        its floor. Subscribed to BankSynced and OrderCompleted in
-        __init__, which between them fire at every point the TODO calls
-        out -- deposits (Executor's deposit-then-sync_bank calls in
-        _switch_task/_run_gather_step/_run_craft_step/
-        _try_deliver_equipment all emit BankSynced), gathers completing,
-        and crafts completing (both also emit OrderCompleted) -- so no new
-        emission points were needed in executor.py/account.py themselves.
+        """Detector half of keep-in-stock threshold detection: bounded
+        sweep over engine.stock_rules that emits StockBelowMinimum for
+        every tracked code currently under its floor. Subscribed to both
+        BankSynced and OrderCompleted in __init__, which between them fire
+        at every point a shortfall could newly appear (deposits, gathers/
+        crafts completing).
 
-        Takes an optional `event` purely so it can be used directly as an
-        EventBus handler for either event type without a wrapper lambda;
-        the event's own fields are never inspected -- neither BankSynced
-        nor OrderCompleted says *which* code(s) may have crossed a
-        threshold, so, like OrderManager._on_bank_synced above, this can't
-        narrow further than 'recheck every tracked rule.' Emitting is
-        cheap/idempotent (no order is created here -- that's
-        _on_stock_below_minimum's job, itself idempotent via
-        _maybe_queue_stock_order's existing-order guard), so re-emitting
-        for a shortfall that was already reported on a previous call is
-        harmless."""
+        Takes an optional, unused `event` so it can be used directly as an
+        EventBus handler for either event type -- neither event says
+        *which* code changed, so this always rechecks every tracked rule.
+        Re-emitting for an already-reported shortfall is harmless; creating
+        the actual order is _on_stock_below_minimum's job, which is
+        idempotent."""
         engine = self.engine
         for rule in engine.stock_rules:
             current = engine.held(rule.code)
@@ -493,13 +421,11 @@ class OrderManager:
                 engine.bus.emit(StockBelowMinimum(code=rule.code, current=current, minimum=rule.minimum))
 
     def _on_stock_below_minimum(self, event: StockBelowMinimum) -> None:
-        """Reaction half of TODO task 10: refresh_stock_orders' response to
-        a StockBelowMinimum event, narrowed to just the one code the event
-        names (via _maybe_queue_stock_order) rather than re-sweeping every
-        rule the way refresh_stock_orders() itself does at startup/on
-        ConfigChanged. Safe to fire repeatedly for the same shortfall --
-        _maybe_queue_stock_order no-ops once a KEEP_STOCK order already
-        exists for the code."""
+        """Reaction half of keep-in-stock threshold detection: narrows to
+        just the one code the event names (via _maybe_queue_stock_order)
+        rather than re-sweeping every rule. Safe to fire repeatedly for the
+        same shortfall -- idempotent via _maybe_queue_stock_order's
+        existing-order guard."""
         self._maybe_queue_stock_order(event.code, event.minimum)
 
     # ------------------------------------------------------------------

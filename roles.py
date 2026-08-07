@@ -54,18 +54,9 @@ class CharacterRole:
 # whatever roster names actually exist via build_roles() below, since
 # renaming to NAME_SCHEME is best-effort (requires an active membership --
 # see ensure_naming_scheme) and silently no-ops when it fails, leaving
-# characters under their original names.
-#
-# Keying a roles dict to literal "Xylan1".."Xylan5" strings meant every
-# role lookup silently missed whenever rename didn't go through, with two
-# compounding effects: assign_default_gather_tasks() fell back to the
-# untailored GATHER_SKILLS order (mining first, for everyone), AND
-# _craft_allowed()'s primary_owner_of() lookup resolved to a name that
-# isn't in account.characters, so `owner` came back None, owner_level
-# defaulted to 0, and `0 >= CRAFT_ALLOWANCE_LEVEL` was always False --
-# silently locking every pure-craft-skill order for every character, all
-# the time, which is also why everyone kept falling back to the
-# copper_ore default even once craft materials were available.
+# characters under their original names. Keying a roles dict to the literal
+# NAME_SCHEME strings instead would silently break role lookups (and thus
+# gather/craft assignment) whenever a rename doesn't go through.
 ROLE_TEMPLATES: List[CharacterRole] = [
     CharacterRole("", "weaponcrafting", ["mining", "woodcutting", "fishing", "alchemy"]),
     CharacterRole("", "gearcrafting", ["woodcutting", "fishing", "alchemy", "mining"]),

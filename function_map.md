@@ -2,6 +2,10 @@
 
 Quick-reference index of every function/method in the project, grouped by file. Use your editor's search to jump to `def <name>` once you know which file it's in.
 
+For the *design history* behind the current architecture (the God-module ->
+four-collaborator split, the event-bus conversion, the concurrency-audit
+fixes), see `ARCHITECTURE.md` at the project root rather than this file.
+
 ---
 
 ## `main.py`
@@ -55,11 +59,18 @@ Low-level HTTP layer. Every action/data method is a thin wrapper around `request
 | Function | Purpose |
 |---|---|
 | `_remaining_from_expiration(expiration_raw)` | Computes true remaining cooldown from absolute `cooldown_expiration`, survives restarts |
+| `sync_character_state(func)` | Decorator: wraps an action method so its response auto-updates `self` via `update_from_dict` |
 
-**`Character`**
+**`Character`** — a character IS the things it can do. There's no separate
+actions/capabilities object bound onto it (that was `CharacterActions.py`,
+merged in here since the two were always 1:1 and tightly coupled) --
+`xylan.rest()`, `xylan.gather()`, `xylan.deposit_all()` etc. are plain
+methods, called directly.
+
+*State / properties*
 | Function | Purpose |
 |---|---|
-| `__init__(raw_data, api=None, map_db=None)` | Parses raw API dict into `skills`/`stats`/`equipment`/`location`, builds `.actions` (`CharacterActions`), `action_lock`, `busy_lock`, `work_available` (event-driven idle signal -- see below) |
+| `__init__(raw_data, api=None, map_db=None)` | Parses raw API dict into `skills`/`stats`/`equipment`/`location`; sets `self.api`/`self.map_db` used by every action method below; builds `action_lock`, `busy_lock`, `work_available` (event-driven idle signal -- see below) |
 | `cooldown` *(property/setter)* | Rounded seconds remaining / sets new cooldown |
 | `is_ready` *(property)* | Cooldown expired? |
 | `inventory_used` *(property)* | Total item count carried |
@@ -70,11 +81,52 @@ Low-level HTTP layer. Every action/data method is a thin wrapper around `request
 | `wait_cooldown()` | Sleeps out any remaining cooldown |
 | `update_from_dict(data)` | Syncs character/stats/skills/equipment/location/inventory from an API response |
 | `is_at(target, y=None)` | Position/Location/tuple/int equality check |
-| `__getstate__` / `__setstate__` | Pickle safety (nulls `action_lock`/`busy_lock`/`work_available`, recreated on unpickle) |
-| `__getattr__(name)` | Falls through to `self.actions.<name>` (e.g. `character.rest()`) |
+| `__getstate__` / `__setstate__` | Pickle safety (nulls `action_lock`/`busy_lock`/`work_available`/`api`, locks+event recreated on unpickle) |
 | `__repr__` | Debug string |
 
-**`work_available`** *(`asyncio.Event`, TODO task 5)*: per-character
+*Action helpers (target normalization, bank lookup)*
+`_normalize_target(target)` · `get_closest_bank(map_db=None)` · `is_at_bank(map_db=None)`
+
+*Movement*
+| Function | Purpose |
+|---|---|
+| `move_to(target)` | Raw move API call (no-ops if already there) |
+| `transition()` | Fires the current tile's transition |
+
+*Combat / rest*
+`fight(target=None, map_db=None)` · `_execute_fight()` · `rest()`
+
+*Bank* (deposit/withdraw items & gold, expansion)
+`_execute_deposit(items)` · `deposit_items(items, map_db=None, return_to_origin=True)` · `deposit_all(map_db=None, return_to_origin=True)` · `_execute_deposit_gold(quantity)` · `deposit_gold(quantity, map_db=None, return_to_origin=True)` · `_execute_withdraw_items(items)` · `withdraw_items(items, map_db=None)` · `_execute_withdraw_gold(quantity)` · `withdraw_gold(quantity, map_db=None)` · `_execute_buy_bank_expansion()` · `buy_bank_expansion(map_db=None)`
+
+*Navigation helpers* (used by fight/gather/craft/npc/GE/tasks)
+| Function | Purpose |
+|---|---|
+| `smart_move(destination, map_db=None)` | Pathfinds via `MapStore` and walks/transitions the route |
+| `temporary_relocate(destination, map_db=None, return_to_origin=True)` | Async context manager: go there, yield, return |
+| `run_and_return(destination, action_coro, *args, map_db=None, **kwargs)` | Runs one coroutine at a destination then returns |
+| `_navigate_to_content(content_identifier, map_db=None)` | Resolves closest tile for a content code and moves there |
+
+*Gathering / Crafting / Recycling*
+`gather(resource=None, map_db=None)` · `_execute_gather()` · `craft(code, quantity=1, workshop=None, map_db=None)` · `_execute_craft(code, quantity=1)` · `recycle(code, quantity=1, enhanced=False, workshop=None, map_db=None)` · `_execute_recycle(code, quantity=1, enhanced=False)`
+
+*Equipment*
+`equip_items(items)` · `equip(code, slot, quantity=1)` · `unequip_items(slots)` · `unequip(slot, quantity=1)` · `use_item(code, quantity=1)`
+> Note: `equip`/`unequip` normalize a trailing `"_slot"` suffix off before hitting the API.
+
+*NPC trading*
+`npc_buy(code, quantity, npc=None, map_db=None)` · `_execute_npc_buy(code, quantity)` · `npc_sell(code, quantity, npc=None, map_db=None)` · `_execute_npc_sell(code, quantity)`
+
+*Grand Exchange*
+`_at_grand_exchange(map_db=None)` · `ge_buy(order_id, quantity, map_db=None)` · `_execute_ge_buy(order_id, quantity)` · `ge_create_sell_order(code, quantity, price, map_db=None)` · `_execute_ge_create_sell_order(...)` · `ge_create_buy_order(code, quantity, price, map_db=None)` · `_execute_ge_create_buy_order(...)` · `ge_fill_buy_order(order_id, quantity, map_db=None)` · `_execute_ge_fill_buy_order(...)` · `ge_cancel_order(order_id, map_db=None)` · `_execute_ge_cancel_order(order_id)`
+
+*Tasks (board)*
+`_at_tasks_master(tasks_master="tasks_master", map_db=None)` · `task_new(...)` · `_execute_task_new()` · `task_complete(...)` · `_execute_task_complete()` · `task_cancel(...)` · `_execute_task_cancel()` · `task_exchange(...)` · `_execute_task_exchange()` · `task_trade(code, quantity, ...)` · `_execute_task_trade(code, quantity)`
+
+*Give / claim / misc*
+`give_gold(quantity, to_character)` · `give_items(items, to_character)` · `claim_pending_item(pending_item_id)` · `delete_item(code, quantity)` · `change_skin(skin)` · `rename(new_name)`
+
+**`work_available`** *(`asyncio.Event`)*: per-character
 event-driven idle signal. `Scheduler.character_loop`'s idle branch
 `await`s this (bounded by a generous fallback timeout) instead of
 unconditionally sleeping `poll_interval`; `Scheduler` subscribes to
@@ -84,54 +136,6 @@ order pool changes in a way that could give them something to do -- see
 `scheduler.py`'s section below.
 
 Dataclasses (no methods): `Skills`, `Stats`, `Equipment`
-
----
-
-## `CharacterActions.py` — `CharacterActions`
-Per-character action set (`character.actions`), one instance per `Character`.
-
-**Decorator**
-| Function | Purpose |
-|---|---|
-| `sync_character_state(func)` | Wraps an action so its response auto-updates `self.character` |
-
-**Setup / helpers**
-`__init__` · `__getstate__` · `__setstate__` · `_normalize_target(target)` · `get_closest_bank(map_db=None)` · `is_at_bank(map_db=None)`
-
-**Movement**
-| Function | Purpose |
-|---|---|
-| `move_to(target)` | Raw move API call (no-ops if already there) |
-| `transition()` | Fires the current tile's transition |
-| `smart_move(destination, map_db=None)` | Pathfinds via `MapStore` and walks/transitions the route |
-| `temporary_relocate(destination, map_db=None, return_to_origin=True)` | Async context manager: go there, yield, return |
-| `run_and_return(destination, action_coro, *args, map_db=None, **kwargs)` | Runs one coroutine at a destination then returns |
-| `_navigate_to_content(content_identifier, map_db=None)` | Resolves closest tile for a content code and moves there |
-
-**Combat / rest**
-`fight(target=None, map_db=None)` · `_execute_fight()` · `rest()`
-
-**Bank** (deposit/withdraw items & gold, expansion)
-`_execute_deposit(items)` · `deposit_items(items, map_db=None, return_to_origin=True)` · `deposit_all(map_db=None, return_to_origin=True)` · `_execute_deposit_gold(quantity)` · `deposit_gold(quantity, map_db=None, return_to_origin=True)` · `_execute_withdraw_items(items)` · `withdraw_items(items, map_db=None)` · `_execute_withdraw_gold(quantity)` · `withdraw_gold(quantity, map_db=None)` · `_execute_buy_bank_expansion()` · `buy_bank_expansion(map_db=None)`
-
-**Gathering / Crafting / Recycling**
-`gather(resource=None, map_db=None)` · `_execute_gather()` · `craft(code, quantity=1, workshop=None, map_db=None)` · `_execute_craft(code, quantity=1)` · `recycle(code, quantity=1, enhanced=False, workshop=None, map_db=None)` · `_execute_recycle(code, quantity=1, enhanced=False)`
-
-**Equipment**
-`equip_items(items)` · `equip(code, slot, quantity=1)` · `unequip_items(slots)` · `unequip(slot, quantity=1)` · `use_item(code, quantity=1)`
-> Note: `equip`/`unequip` normalize a trailing `"_slot"` suffix off before hitting the API.
-
-**NPC trading**
-`npc_buy(code, quantity, npc=None, map_db=None)` · `_execute_npc_buy(code, quantity)` · `npc_sell(code, quantity, npc=None, map_db=None)` · `_execute_npc_sell(code, quantity)`
-
-**Grand Exchange**
-`_at_grand_exchange(map_db=None)` · `ge_buy(order_id, quantity, map_db=None)` · `_execute_ge_buy(order_id, quantity)` · `ge_create_sell_order(code, quantity, price, map_db=None)` · `_execute_ge_create_sell_order(...)` · `ge_create_buy_order(code, quantity, price, map_db=None)` · `_execute_ge_create_buy_order(...)` · `ge_fill_buy_order(order_id, quantity, map_db=None)` · `_execute_ge_fill_buy_order(...)` · `ge_cancel_order(order_id, map_db=None)` · `_execute_ge_cancel_order(order_id)`
-
-**Tasks (board)**
-`_at_tasks_master(tasks_master="tasks_master", map_db=None)` · `task_new(...)` · `_execute_task_new()` · `task_complete(...)` · `_execute_task_complete()` · `task_cancel(...)` · `_execute_task_cancel()` · `task_exchange(...)` · `_execute_task_exchange()` · `task_trade(code, quantity, ...)` · `_execute_task_trade(code, quantity)`
-
-**Give / claim / misc**
-`give_gold(quantity, to_character)` · `give_items(items, to_character)` · `claim_pending_item(pending_item_id)` · `delete_item(code, quantity)` · `change_skin(skin)` · `rename(new_name)`
 
 ---
 
@@ -164,9 +168,9 @@ Per-character action set (`character.actions`), one instance per `Character`.
 | `set_map_db(map_db)` | Late-binds map DB, propagates to all characters |
 | `rate_limiter` *(property)* | Proxies `api.rate_limiter` |
 | `sync_details()` | `GET /my/details` |
-| `sync_bank()` | `GET /my/bank` + paginated `/my/bank/items`; emits `BankSynced` on `self.bus` at the end (TODO task 6 -- no-ops if `self.bus` is still `None`, see below) |
-| `sync_pending_items()` | Paginated `/my/pending_items`; also emits `BankSynced` at the end (optional per TODO task 6 -- pending items rarely change bank state directly, but it's a cheap nudge for any subscriber tracking "account state may have changed") |
-| `set_bus(bus)` | Late-binds `engine.bus` onto the account (TODO task 6) -- called once by `TaskEngine.__init__` right after it builds `self.bus`. Needed because `Account` is constructed and first `sync()`ed in `main.py` *before* `TaskEngine`/its bus exist, so the bus can't be a constructor arg; mirrors `set_map_db`'s late-binding pattern |
+| `sync_bank()` | `GET /my/bank` + paginated `/my/bank/items`; emits `BankSynced` on `self.bus` at the end (no-ops if `self.bus` is still `None`, see `set_bus` below) |
+| `sync_pending_items()` | Paginated `/my/pending_items`; also emits `BankSynced` at the end -- pending items rarely change bank state directly, but it's a cheap nudge for any subscriber tracking account state |
+| `set_bus(bus)` | Late-binds `engine.bus` onto the account -- called once by `TaskEngine.__init__` right after it builds `self.bus`. Needed because `Account` is constructed and first `sync()`ed in `main.py` *before* `TaskEngine`/its bus exist, so the bus can't be a constructor arg; mirrors `set_map_db`'s late-binding pattern |
 | `sync_active_events()` | Paginated `/events/active` |
 | `sync_characters()` | Builds/updates `Character` objects from `/my/characters` |
 | `sync_rate_limits()` | `GET /my/rates` |
@@ -181,6 +185,7 @@ Pure dataclasses/enums shared across modules.
 
 | Function | Purpose |
 |---|---|
+| `find_quantity(items, code)` | Returns the `.quantity` of the first item in `items` (a bank/inventory list) whose `.code` matches, or 0 if none does. Shared helper for the `next((i.quantity for i in ... if i.code == code), 0)` pattern used in `order_manager.py`/`executor.py` |
 | `parse_reset(value)` | Parses a timestamp (epoch or ISO string) into `datetime` |
 | `Task.is_complete` / `Task.is_active` *(properties)* | Task-state checks |
 | `Resource.from_dict(data)` *(classmethod)* | |
@@ -216,8 +221,10 @@ Plain dataclasses with no methods: `Position`, `Location`, `InventoryItem`, `Rec
 ---
 
 ## `events.py` — `EventBus` + domain event dataclasses
-Foundation for converting `task_runner.py`'s four polling loops (see TODO)
-into reactive subscribers. Pure `asyncio`, no new dependency.
+The pub/sub backbone `task_runner.py`'s four collaborators use to react to
+engine state changes instead of polling for them. Pure `asyncio`, no new
+dependency. See the events table and status note below for the current
+wiring, or `ARCHITECTURE.md` for why it's built this way.
 
 | Function | Purpose |
 |---|---|
@@ -232,9 +239,9 @@ into reactive subscribers. Pure `asyncio`, no new dependency.
 > `complete`, `Executor`'s steps). Awaiting subscribers synchronously there
 > risks a reentrant deadlock if a handler calls back into the engine (e.g. a
 > `StockBelowMinimum` handler that itself claims/releases an order).
-> Scheduling each handler as an independent task sidesteps that -- see the
-> task 12 concurrency-audit item in TODO, which should re-check this as
-> real subscribers land.
+> Scheduling each handler as an independent task sidesteps that. See
+> `ARCHITECTURE.md` for the fuller rationale and the concurrency-audit
+> fixes this pattern interacts with.
 
 **Domain events** (all plain dataclasses, deliberately flat -- ids/codes
 only, never a full `WorkOrder`/`Character` object, so a subscriber always
@@ -248,114 +255,49 @@ looks up current live state via `engine.orders[order_id]` /
 | `OrderClaimed` | **live** — `Scheduler.claim`, after `order.claimed_by`/`locked_to`/`engine._current_order` are updated | `order_id, character_name` |
 | `OrderReleased` | **live** — `Scheduler.release`, after the same bookkeeping is undone | `order_id, character_name` |
 | `OrderCompleted` | **live** — `Scheduler.complete` (also reached via `TaskEngine.complete`, a thin forward), after `order.done`/`claimed_by`/`locked_to` are updated | `order_id, code` |
-| `BankSynced` | **live** — `Account.sync_bank` (+ `sync_pending_items`, also wired per the "optionally") — TODO task 6, done | *(no fields)* |
+| `BankSynced` | **live** — `Account.sync_bank` (+ `sync_pending_items`) | *(no fields)* |
 | `EquipmentRequested` | **live** — `OrderManager.request_item`, whenever a `requester`/`equip_slot` pair is queued on a new-or-existing order (covers `request_equipment` calls too, since it routes through `request_item`) | `order_id, character_name, code, slot` |
-| `EquipmentDelivered` | **live** — `Executor._try_deliver_equipment`, right after a single queued `(character, slot)` request is popped and equipped — TODO task 7, done | `order_id, character_name, code, slot` |
-| `StockBelowMinimum` | **live** — `OrderManager._check_stock_thresholds` — TODO task 10, done. Subscribed to `BankSynced`/`OrderCompleted` (the same two events that already fire at every point the task calls out: deposits, gathers completing, crafts completing), it re-sweeps `engine.stock_rules` and emits one `StockBelowMinimum` per rule currently under its floor. Consumed reactively by `OrderManager._on_stock_below_minimum`, which narrows straight to `_maybe_queue_stock_order(event.code, event.minimum)` | `code, current, minimum` |
-| `ConfigChanged` | **live** — `ConfigWatcher.loop`, when an `os.stat().st_mtime` check finds `stock_config.json`'s mtime has moved since the last check — TODO task 9, done | `path` |
+| `EquipmentDelivered` | **live** — `Executor._try_deliver_equipment`, right after a single queued `(character, slot)` request is popped and equipped | `order_id, character_name, code, slot` |
+| `StockBelowMinimum` | **live** — `OrderManager._check_stock_thresholds`, subscribed to `BankSynced`/`OrderCompleted` (the two events that fire at every point a shortfall could newly appear: deposits, gathers completing, crafts completing). Re-sweeps `engine.stock_rules` and emits one `StockBelowMinimum` per rule currently under its floor. Consumed reactively by `OrderManager._on_stock_below_minimum`, which narrows straight to `_maybe_queue_stock_order(event.code, event.minimum)` | `code, current, minimum` |
+| `ConfigChanged` | **live** — `ConfigWatcher.loop`, when an `os.stat().st_mtime` check finds `stock_config.json`'s mtime has moved since the last check | `path` |
 
-> **Status:** the bus is now wired into `TaskEngine` (TODO task 2):
-> `TaskEngine.__init__` builds `self.bus = EventBus()` before constructing
-> `OrderManager`/`Scheduler`/`Executor`/`ConfigWatcher`, and since each of
-> those already takes an `engine` reference at construction, they all reach
-> it via `self.engine.bus` -- no constructor signature changes were needed
-> anywhere. TODO task 3 is now done: `order_manager.py` emits `OrderCreated`/
-> `OrderUpdated`/`EquipmentRequested` (see its section below). TODO task 4 is
-> now done too: `scheduler.py`'s `Scheduler.claim`/`release`/`complete` each
-> emit `OrderClaimed`/`OrderReleased`/`OrderCompleted` on `engine.bus` right
-> after mutating `order.claimed_by`/`locked_to`/`done`/`engine._current_order`
-> (see its section below). **TODO task 5 is now done too:** `Scheduler`
-> subscribes to `OrderCreated`/`OrderUpdated`/`OrderReleased`/
-> `OrderCompleted` at construction time and wakes the relevant `Character`s'
-> new `work_available` `asyncio.Event`s (see `character.py`'s and
-> `scheduler.py`'s sections above), so **polling site 1,
-> `Scheduler.character_loop`, is now event-driven** -- its idle branch
-> `await`s `work_available` (with a generous fallback timeout) instead of
-> `asyncio.sleep(engine.poll_interval)`. **TODO task 6 is now done too:**
-> `account.py`'s `Account.sync_bank`/`sync_pending_items` emit `BankSynced`
-> on `self.bus` (late-bound via the new `Account.set_bus`, called from
-> `TaskEngine.__init__` right after `self.bus` is built -- `Account` is
-> constructed and first synced in `main.py` before the engine/bus exist, so
-> `self.bus` starts as `None` and the emit is a no-op until `set_bus` runs).
-> **TODO task 7 is now done too:** `executor.py`'s `Executor.__init__`
-> subscribes to `EquipmentRequested` and `BankSynced` on `engine.bus` and
-> reacts by calling `Executor._try_deliver_equipment` only for the order(s)
-> implicated by that event (see `executor.py`'s section below) --
-> **polling site 2, the old `TaskEngine._delivery_loop`, is now
-> event-driven.** The old scan-every-tick loop was kept, per the TODO's
-> task-7 open decision, as a much-lower-frequency belt-and-suspenders
-> backstop rather than removed outright: renamed
-> `TaskEngine._delivery_safety_sweep_loop`, it now sleeps
-> `poll_interval * TaskEngine.DELIVERY_SWEEP_MULTIPLIER` (20x) between
-> sweeps instead of `poll_interval`, and only re-sweeps orders that
-> currently have pending `equip_requests` (same scoping the reactive path
-> uses), rather than truly scanning every live order every tick. `executor.py`
-> also now emits `EquipmentDelivered` at the point a single request is
-> fulfilled (see the table above). **TODO task 8 is now done too:**
-> `order_manager.py`'s `OrderManager.__init__` subscribes to `OrderCompleted`
-> and `BankSynced` on `engine.bus` (same pattern as `Executor.__init__`) and
-> reacts by calling the new `OrderManager._maybe_auto_convert(raw_code)` --
-> either for just the one code a completed order implicates, or (for
-> `BankSynced`, which carries no code) by sweeping the same bounded
-> `_single_use_conversions` dict `refresh_auto_convert_orders` always used,
-> never the whole order pool -- see `order_manager.py`'s section below.
-> **Polling site 3, the old `TaskEngine._auto_convert_loop`, is now
-> event-driven:** renamed `TaskEngine._auto_convert_safety_sweep_loop`, it
-> now sleeps `poll_interval * TaskEngine.AUTO_CONVERT_SWEEP_MULTIPLIER`
-> (20x) between sweeps instead of `poll_interval`, kept as a backstop per
-> the same belt-and-suspenders tradeoff task 7 made for delivery.
-> **TODO task 9 is now done too:** `config_watcher.py`'s `ConfigWatcher.loop`
-> no longer unconditionally re-reads and re-parses `stock_config.json` every
-> ~10x `poll_interval`. It now does a cheap `os.stat().st_mtime` check every
-> `ConfigWatcher.MTIME_CHECK_INTERVAL` (2s) — inode metadata only, no file
-> content read — and emits `ConfigChanged` on `engine.bus` only when the
-> mtime has genuinely moved since the last check (or since
-> `load_stock_rules_from_file`'s own baseline). `ConfigWatcher.__init__`
-> subscribes its own `_on_config_changed` handler to `ConfigChanged` (same
-> subscribe-in-`__init__` pattern as `Scheduler`/`Executor`/`OrderManager`),
-> which does the actual reparse (`load_stock_rules_from_file`) +
-> `engine.order_manager.refresh_stock_orders()` call — the same two-step
-> that used to run unconditionally on every old timer tick, now gated on a
-> real change. This is the dependency-free path from the TODO's task-9 open
-> decision (no `watchdog` added). **Polling site 4, `ConfigWatcher.loop`, is
-> now effectively event-driven too** — the loop still exists (it's what
-> performs the cheap mtime check), but the expensive work (JSON parse + full
-> `stock_rules` rebuild + `refresh_stock_orders` sweep) only happens
-> reactively, in `_on_config_changed`, in response to a real file change.
-> **TODO task 10 is now done too:** `order_manager.py`'s `OrderManager.__init__`
-> subscribes `_check_stock_thresholds` to both `BankSynced` and `OrderCompleted`
-> (the same two events tasks 7/8 already piggyback on) -- between them they
-> fire at every point task 10 calls out (deposits, gathers completing, crafts
-> completing all route through `Executor`'s deposit-then-`sync_bank` calls,
-> which emit `BankSynced`; gathers/crafts finishing also emit
-> `OrderCompleted`), so no new emission points were needed in
-> `executor.py`/`account.py` themselves. `_check_stock_thresholds` re-sweeps
-> `engine.stock_rules` (bounded, same as `refresh_stock_orders` always was)
-> and emits `StockBelowMinimum` for anything currently under its floor;
-> `OrderManager.__init__` also subscribes `_on_stock_below_minimum` to that
-> event, which narrows straight to `_maybe_queue_stock_order(event.code,
-> event.minimum)` -- the same per-code logic `refresh_stock_orders` was
-> refactored to share (see `order_manager.py`'s section below) -- rather
-> than re-sweeping every rule again. `refresh_stock_orders` is therefore no
-> longer only-at-startup-or-config-reload: it (or its per-code equivalent)
-> now also runs reactively whenever bank/inventory state could plausibly
-> have changed. TODO task 11 (TTL-cache audit) and task 12 (concurrency/
-> safety pass) are also done -- see their own writeups in `TODO` and, for
-> task 12's fixes, the relevant entries in `orders.py`/`executor.py`/
-> `task_runner.py`'s sections below. **TODO task 13 is now done too:**
-> `tests/test_events.py`, a plain-asyncio smoke test covering all three of
-> the task's asks -- see the `tests/test_events.py` section near the end of
-> this file. **TODO task 14 (final docstring/map consistency pass) is now
-> done too:** `task_runner.py`'s and `config_watcher.py`'s module
-> docstrings both already described the event-driven design in full
-> (updated incrementally as tasks 7/9/12 landed rather than left
-> describing polling until now) -- the only stale wording found was one
-> module-boundary bullet in `task_runner.py` undersold `ConfigWatcher`'s
-> task-9 mtime-diff design as pushing changes "on a timer"; reworded to
-> name the reactive mtime-diff explicitly. This file was read through in
-> full for consistency; the "Quick where do I...?" index and every
-> collaborator section below were already current. **All 14 TODO tasks
-> are now complete.**
+> **Status:** `TaskEngine.__init__` builds `self.bus = EventBus()` before
+> constructing `OrderManager`/`Scheduler`/`Executor`/`ConfigWatcher`, and
+> each of those reaches it via `self.engine.bus`. Current wiring, by
+> collaborator:
+>
+> - **`order_manager.py`** emits `OrderCreated`/`OrderUpdated`/
+>   `EquipmentRequested` from `request_item` (via `_finalize_new_order`).
+>   It subscribes `_on_order_completed`/`_on_bank_synced` to
+>   `OrderCompleted`/`BankSynced` for auto-convert (`_maybe_auto_convert`),
+>   and `_check_stock_thresholds` to those same two events for
+>   keep-in-stock, which emits `StockBelowMinimum` -> consumed by
+>   `_on_stock_below_minimum` -> `_maybe_queue_stock_order`.
+> - **`scheduler.py`**'s `claim`/`release`/`complete` emit
+>   `OrderClaimed`/`OrderReleased`/`OrderCompleted`. `Scheduler` subscribes
+>   to those plus `OrderCreated`/`OrderUpdated` to wake the relevant
+>   `Character.work_available` events; `character_loop`'s idle branch
+>   `await`s that event (bounded by `IDLE_WAIT_FALLBACK_MULTIPLIER`)
+>   instead of unconditionally sleeping `poll_interval`.
+> - **`executor.py`** subscribes to `EquipmentRequested`/`BankSynced` to
+>   trigger `_try_deliver_equipment`, and emits `EquipmentDelivered` when a
+>   request is fulfilled. `TaskEngine._delivery_safety_sweep_loop` is a
+>   much-lower-frequency backstop (`DELIVERY_SWEEP_MULTIPLIER`, 20x
+>   `poll_interval`).
+> - **`account.py`**'s `sync_bank`/`sync_pending_items` emit `BankSynced`,
+>   late-bound via `Account.set_bus` (called from `TaskEngine.__init__`,
+>   since `Account` is constructed before the bus exists).
+> - **`config_watcher.py`**'s `loop` does a cheap `os.stat().st_mtime`
+>   check every `MTIME_CHECK_INTERVAL` and emits `ConfigChanged` only when
+>   the file has actually moved; `_on_config_changed` does the real
+>   reparse + `refresh_stock_orders()` work.
+> - `TaskEngine._auto_convert_safety_sweep_loop` is the same kind of
+>   backstop for auto-convert (`AUTO_CONVERT_SWEEP_MULTIPLIER`, 20x
+>   `poll_interval`).
+> - `tests/test_events.py` exercises all of the above reactively.
+>
+> For the full why (God-module split, fire-and-forget rationale,
+> safety-sweep pattern, concurrency-audit fixes), see `ARCHITECTURE.md`.
 
 ---
 
@@ -368,7 +310,7 @@ looks up current live state via `engine.orders[order_id]` /
 
 Enums: `OrderKind` (GATHER/CRAFT), `Priority` (DEFAULT/AUTO_CRAFT/KEEP_STOCK/GATHER/CRAFT/EQUIP, ascending). `EQUIP` (40) is the top tier, above `CRAFT` (30) by more than `INERTIA_BONUS` (5), so an equip request always outranks and interrupts whatever a character is currently doing — see `OrderManager.request_equipment`. `AUTO_CRAFT` (5) sits just above `DEFAULT` (0) and below `KEEP_STOCK` (10) — see `OrderManager.refresh_auto_convert_orders`. Constant: `INERTIA_BONUS`.
 
-`WorkOrder._delivering` *(bool, default `False`, TODO task 12)*: non-blocking re-entrancy guard consumed by `executor.Executor._try_deliver_equipment` — see that method's entry in `executor.py`'s section below. Deliberately a plain field rather than an `asyncio.Lock`: the whole point is that a losing concurrent caller returns immediately instead of blocking (see the concurrency-audit note at the bottom of this file).
+`WorkOrder._delivering` *(bool, default `False`)*: non-blocking re-entrancy guard consumed by `executor.Executor._try_deliver_equipment` — see that method's entry in `executor.py`'s section below. Deliberately a plain field rather than an `asyncio.Lock`: the whole point is that a losing concurrent caller returns immediately instead of blocking. See `ARCHITECTURE.md` for the full concurrency-audit rationale.
 
 ---
 
@@ -409,10 +351,10 @@ unaffected — see below), and top-level lifecycle.
 split — forwards to whichever collaborator now owns the logic):
 `request_item` · `request_equipment` · `request_upgrades_for` · `add_stock_rule` · `load_stock_rules_from_file` · `refresh_stock_orders` · `refresh_auto_convert_orders` · `set_default_gather_task` · `assign_default_gather_tasks` · `character_eligible` · `select_order_for` · `claim` · `release` · `verify` · `print_plan_tree` · `character_loop` · `held` · `complete`
 
-**Lifecycle (stays on `TaskEngine`)**: `initialize()` · `_auto_convert_safety_sweep_loop()` · `_delivery_safety_sweep_loop()` · `run()` · `stop()` (**TODO task 12**: now also calls `order_manager.close()`/`scheduler.close()`/`executor.close()`/`config_watcher.close()` to unsubscribe every bus handler the four collaborators registered in their own `__init__`, in addition to setting `self.running = False`)
+**Lifecycle (stays on `TaskEngine`)**: `initialize()` · `_auto_convert_safety_sweep_loop()` · `_delivery_safety_sweep_loop()` · `run()` · `stop()` (calls `order_manager.close()`/`scheduler.close()`/`executor.close()`/`config_watcher.close()` to unsubscribe every bus handler the four collaborators registered in their own `__init__`, in addition to setting `self.running = False`)
 
 **`DELIVERY_SWEEP_MULTIPLIER`** / **`AUTO_CONVERT_SWEEP_MULTIPLIER`**
-*(class constants, both = 20)*: how much less often `_delivery_safety_sweep_loop`/`_auto_convert_safety_sweep_loop` sweep vs. the old per-`poll_interval` polling loops they replaced (TODO tasks 7 & 8) -- both loops are now pure backstops behind the reactive `Executor`/`OrderManager` bus subscriptions, not the primary mechanism.
+*(class constants, both = 20)*: how much less often `_delivery_safety_sweep_loop`/`_auto_convert_safety_sweep_loop` sweep vs. `poll_interval` -- both loops are pure backstops behind the reactive `Executor`/`OrderManager` bus subscriptions, not the primary mechanism. See `ARCHITECTURE.md` for why the backstops exist at all.
 
 ---
 
@@ -420,7 +362,8 @@ split — forwards to whichever collaborator now owns the logic):
 **Order creation / expansion**
 | Function | Purpose |
 |---|---|
-| `request_item(code, quantity, tier=None, requester=None, equip_slot=None, parent_id=None)` | Creates/bumps CRAFT or GATHER orders recursively; checks the bank first and skips straight to `engine.complete()` if bank stock already covers the requested quantity (no live-but-unworkable order left dangling). **The single place `OrderCreated`/`OrderUpdated`/`EquipmentRequested` get emitted on `engine.bus`** (TODO task 3) — new order → `OrderCreated`; bumping an existing order's `target_quantity` → `OrderUpdated`; a `requester`/`equip_slot` pair queued (new or bumped order) → `EquipmentRequested`. Every other method below that creates/bumps orders routes through here rather than emitting anything itself |
+| `request_item(code, quantity, tier=None, requester=None, equip_slot=None, parent_id=None)` | Creates/bumps CRAFT or GATHER orders recursively; checks the bank first (via `models.find_quantity`) and skips straight to `engine.complete()` if bank stock already covers the requested quantity (no live-but-unworkable order left dangling). **The single place `OrderCreated`/`OrderUpdated`/`EquipmentRequested` get emitted on `engine.bus`** (the CRAFT and GATHER branches both funnel their `OrderCreated`/`EquipmentRequested` emission through the shared `_finalize_new_order` helper) — new order → `OrderCreated`; bumping an existing order's `target_quantity` → `OrderUpdated`; a `requester`/`equip_slot` pair queued (new or bumped order) → `EquipmentRequested`. Every other method below that creates/bumps orders routes through here rather than emitting anything itself |
+| `_finalize_new_order(order, requester, equip_slot, code)` | Shared tail of `request_item`'s CRAFT and GATHER branches: inserts the new order into `engine.orders` and emits `OrderCreated`, plus `EquipmentRequested` if a `requester`/`equip_slot` pair was given. Callers still handle the bank-coverage check and (CRAFT only) ingredient expansion themselves, since those differ between the two branches |
 | `_bump_ingredients(craft_order, extra_output, tier)` | Cascades a target bump down to ingredient orders (emits nothing directly — via `request_item`) |
 | `request_equipment(character_name, code, slot, quantity=1)` | `request_item` + equip-on-completion, forcing `Priority.EQUIP` across the *entire* expansion (top-level order + every recursive ingredient order) so equipping is high-priority and interrupts whatever the character/roster is currently doing (emits nothing directly — via `request_item`) |
 | `request_upgrades_for(character)` | Wraps `GearList.for_upgrades`, wires up equip delivery |
@@ -430,21 +373,21 @@ split — forwards to whichever collaborator now owns the logic):
 |---|---|
 | `add_stock_rule(code, minimum)` | Appends one `StockRule` to `engine.stock_rules` |
 | `refresh_stock_orders()` | Full (but bounded — only `engine.stock_rules`, never the whole order pool) sweep: calls `_maybe_queue_stock_order` for every registered rule. Used by startup (`TaskEngine.run`), the `ConfigChanged` reactive handler (`ConfigWatcher._on_config_changed`), and (indirectly, one rule at a time) the `StockBelowMinimum` reactive handler below |
-| `_maybe_queue_stock_order(code, minimum)` | **TODO task 10**, extracted from `refresh_stock_orders` so a single code can be topped up without re-sweeping every other rule (mirrors `_maybe_auto_convert`'s extraction from `refresh_auto_convert_orders` for task 8). No-ops if `code` is already at/above `minimum` or a live order for it already exists; otherwise queues a `KEEP_STOCK`-tier order via `request_item` for the shortfall (emits nothing directly — via `request_item`) |
-| `_check_stock_thresholds(event=None)` | **TODO task 10, reactive.** Subscribed to both `BankSynced` and `OrderCompleted` in `__init__` — the same two events tasks 7/8 already piggyback on, which between them fire at every point task 10 calls out (deposits, gathers completing, crafts completing). Bounded sweep over `engine.stock_rules`; emits `events.StockBelowMinimum(code, current, minimum)` for every rule currently under its floor. Takes an optional/ignored `event` arg so it can be used directly as the handler for either event type |
-| `_on_stock_below_minimum(event)` | **TODO task 10, reactive.** Subscribed to `StockBelowMinimum`; narrows straight to `_maybe_queue_stock_order(event.code, event.minimum)` rather than re-sweeping every rule |
-| `close()` | **TODO task 12.** Unsubscribes every handler registered in `__init__` (`_on_order_completed`, `_on_bank_synced`, `_check_stock_thresholds` x2, `_on_stock_below_minimum` -- tracked in `self._subscriptions`) from `engine.bus` -- called by `TaskEngine.stop()` |
+| `_maybe_queue_stock_order(code, minimum)` | Per-code keep-in-stock logic, extracted from `refresh_stock_orders` so a single code can be topped up without re-sweeping every other rule. No-ops if `code` is already at/above `minimum` or a live order for it already exists; otherwise queues a `KEEP_STOCK`-tier order via `request_item` for the shortfall (emits nothing directly — via `request_item`) |
+| `_check_stock_thresholds(event=None)` | Detector half of keep-in-stock threshold detection. Subscribed to both `BankSynced` and `OrderCompleted` in `__init__` — between them, every point a shortfall could newly appear (deposits, gathers/crafts completing). Bounded sweep over `engine.stock_rules`; emits `events.StockBelowMinimum(code, current, minimum)` for every rule currently under its floor. Takes an optional/ignored `event` arg so it can be used directly as the handler for either event type |
+| `_on_stock_below_minimum(event)` | Reaction half of keep-in-stock threshold detection. Subscribed to `StockBelowMinimum`; narrows straight to `_maybe_queue_stock_order(event.code, event.minimum)` rather than re-sweeping every rule |
+| `close()` | Unsubscribes every handler registered in `__init__` (`_on_order_completed`, `_on_bank_synced`, `_check_stock_thresholds` x2, `_on_stock_below_minimum` -- tracked in `self._subscriptions`) from `engine.bus` -- called by `TaskEngine.stop()` |
 
-> File-backed loading of stock rules (`load_stock_rules_from_file`, the periodic reload loop) moved to `config_watcher.py` — see below.
+> File-backed loading of stock rules (`load_stock_rules_from_file`, the periodic reload loop) lives in `config_watcher.py` — see below.
 
 **Auto-convert (single-use gathered raw materials → their sole crafted product)**
 | Function | Purpose |
 |---|---|
 | `_build_single_use_conversions()` | Cached scan of the item catalog: maps each default-gathered raw material's code to the one `Item` that consumes it, but only when it's used by exactly one recipe (e.g. `copper_ore`→`copper_bar`, `raw_chicken`→`cooked_chicken`) |
 | `refresh_auto_convert_orders()` | Full (but bounded -- only the cached `_single_use_conversions` dict, never the whole order pool) sweep: calls `_maybe_auto_convert` for every candidate raw material. Used by startup (`TaskEngine.run`), the `BankSynced` reactive handler, and the low-frequency safety-sweep loop |
-| `_maybe_auto_convert(raw_code)` | Per-candidate logic (TODO task 8, extracted from `refresh_auto_convert_orders` so a single code can be checked without re-scanning the rest): if `raw_code` is a single-use conversion candidate, queues a `Priority.AUTO_CRAFT` craft order to convert whatever's currently held above its keep-in-stock floor (`StockRule.minimum`, or 100 if unset) into the finished item — never dips below that floor, never duplicates an order already in flight for the target, silently no-ops for a non-candidate code (emits nothing directly — via `request_item`) |
-| `_on_order_completed(event)` | **TODO task 8, reactive.** Narrows straight to `_maybe_auto_convert(event.code)` -- if the just-completed order's code isn't a conversion candidate this is a harmless no-op |
-| `_on_bank_synced(event)` | **TODO task 8, reactive.** `BankSynced` carries no code, so this re-runs the full (but still bounded) `refresh_auto_convert_orders()` sweep |
+| `_maybe_auto_convert(raw_code)` | Per-candidate logic, extracted from `refresh_auto_convert_orders` so a single code can be checked without re-scanning the rest: if `raw_code` is a single-use conversion candidate, queues a `Priority.AUTO_CRAFT` craft order to convert whatever's currently held above its keep-in-stock floor (`StockRule.minimum`, or 100 if unset) into the finished item — never dips below that floor, never duplicates an order already in flight for the target, silently no-ops for a non-candidate code (emits nothing directly — via `request_item`) |
+| `_on_order_completed(event)` | Narrows straight to `_maybe_auto_convert(event.code)` -- if the just-completed order's code isn't a conversion candidate this is a harmless no-op |
+| `_on_bank_synced(event)` | `BankSynced` carries no code, so this re-runs the full (but still bounded) `refresh_auto_convert_orders()` sweep |
 
 **Default (fallback) tasks**
 `set_default_gather_task(character_name, resource_code)` · `assign_default_gather_tasks()`
@@ -459,17 +402,17 @@ split — forwards to whichever collaborator now owns the logic):
 `_craft_allowed(character, skill)` · `character_eligible(character, order)` · `_score(character, order)` · `_available_for_craft(character, code)` · `_materials_available(character, order)` · `select_order_for(character)`
 
 **Claim / release / complete** (each also emits its matching lifecycle
-event on `engine.bus` -- TODO task 4 -- right after updating
+event on `engine.bus` right after updating
 `order.claimed_by`/`locked_to`/`done`/`engine._current_order`, so a future
-subscriber always sees post-mutation state. TODO task 12 audit: these
-emits are safe even though claim/release/complete are typically called
-while `character.busy_lock` is held upstream -- `EventBus.emit` is
+subscriber always sees post-mutation state. These emits are safe even
+though claim/release/complete are typically called while
+`character.busy_lock` is held upstream -- `EventBus.emit` is
 fire-and-forget, so no subscriber runs synchronously inside that lock)
 `claim(character, order)` (emits `OrderClaimed`) · `release(character, order)` (emits `OrderReleased`) · `complete(order)` (emits `OrderCompleted`; also reachable via `TaskEngine.complete`, a thin forward used by `order_manager.py`/`executor.py`)
 
-`close()`: **TODO task 12.** Unsubscribes `_on_order_created`/`_on_order_updated`/`_on_order_released`/`_on_order_completed` from `engine.bus` (tracked in `self._subscriptions`, set at construction) -- called by `TaskEngine.stop()`.
+`close()`: Unsubscribes `_on_order_created`/`_on_order_updated`/`_on_order_released`/`_on_order_completed` from `engine.bus` (tracked in `self._subscriptions`, set at construction) -- called by `TaskEngine.stop()`.
 
-**Event-driven idle wakeups** *(TODO task 5 -- done)*: `Scheduler.__init__`
+**Event-driven idle wakeups**: `Scheduler.__init__`
 subscribes to `OrderCreated`/`OrderUpdated`/`OrderReleased`/`OrderCompleted`
 on `engine.bus`.
 | Function | Purpose |
@@ -482,7 +425,7 @@ on `engine.bus`.
 **The live per-character loop**
 | Function | Purpose |
 |---|---|
-| `character_loop(character)` *(async)* | Per-character infinite loop: pick order (`select_order_for`) → switch (`engine.executor._switch_task`) → act (`engine.executor._run_gather_step`/`_run_craft_step`) (holds `character.busy_lock`); when idle (`order is None` or the step raised), `await`s `character.work_available.wait()` bounded by `asyncio.wait_for(..., timeout=engine.poll_interval * Scheduler.IDLE_WAIT_FALLBACK_MULTIPLIER)` instead of unconditionally sleeping `poll_interval`, then clears the event -- TODO task 5 |
+| `character_loop(character)` *(async)* | Per-character infinite loop: pick order (`select_order_for`) → switch (`engine.executor._switch_task`) → act (`engine.executor._run_gather_step`/`_run_craft_step`) (holds `character.busy_lock`); when idle (`order is None` or the step raised), `await`s `character.work_available.wait()` bounded by `asyncio.wait_for(..., timeout=engine.poll_interval * Scheduler.IDLE_WAIT_FALLBACK_MULTIPLIER)` instead of unconditionally sleeping `poll_interval`, then clears the event |
 
 **`IDLE_WAIT_FALLBACK_MULTIPLIER`** *(class constant, = 10)*: bounds how
 long `character_loop`'s idle wait can block past `poll_interval` if a
@@ -494,14 +437,14 @@ primary wake path, this is only the safety net.
 ### `executor.py` — `Executor`
 | Function | Purpose |
 |---|---|
-| `close()` | **TODO task 12.** Unsubscribes `_on_equipment_requested`/`_on_bank_synced` from `engine.bus` (tracked in `self._subscriptions`, set at construction) -- called by `TaskEngine.stop()` |
+| `close()` | Unsubscribes `_on_equipment_requested`/`_on_bank_synced` from `engine.bus` (tracked in `self._subscriptions`, set at construction) -- called by `TaskEngine.stop()` |
 | `_switch_task(character, new_order)` *(async)* | Handles claim/release (via `engine.scheduler`) + deposit-on-switch |
-| `_try_deliver_equipment(order, *, already_locked=None)` *(async)* | Non-blocking re-entrancy guard (`order._delivering`, TODO task 12) around `_deliver_equipment_queue` -- a losing concurrent call for the same order returns immediately rather than blocking (see the function's own docstring for why blocking here can deadlock) |
-| `_deliver_equipment_queue(order, *, already_locked)` *(async)* | **TODO task 12**, extracted from the old `_try_deliver_equipment` body. Pops queued `(character, slot)` requests one at a time, delivering each via `_deliver_one` -- inline (no lock re-acquire) if `char_name == already_locked` (the calling character already holds their own `busy_lock`), else under `async with requester.busy_lock`. Stops (leaves the entry queued) if `_deliver_one` returns `None` (couldn't resolve a bank) |
-| `_deliver_one(requester, order, slot, map_db)` *(async)* | **TODO task 12**, extracted from the old `_try_deliver_equipment` body. The actual move-unequip-deposit-withdraw-equip sequence for one request; returns the old item's code (`""` if the slot was empty, `None` if no bank could be resolved -- the two are distinguished so the caller knows whether to stop) |
-| `_run_gather_step(character, order)` *(async)* | One gather action + deposit-if-full/if-done; calls `_try_deliver_equipment(order, already_locked=character.name)` on completion (TODO task 12 -- see that param's docstring for why this can't be omitted) |
+| `_try_deliver_equipment(order, *, already_locked=None)` *(async)* | Non-blocking re-entrancy guard (`order._delivering`) around `_deliver_equipment_queue` -- a losing concurrent call for the same order returns immediately rather than blocking (see the function's own docstring for why blocking here can deadlock) |
+| `_deliver_equipment_queue(order, *, already_locked)` *(async)* | Extracted from `_try_deliver_equipment`'s body. Pops queued `(character, slot)` requests one at a time (checking bank stock via `models.find_quantity`), delivering each via `_deliver_one` -- inline (no lock re-acquire) if `char_name == already_locked` (the calling character already holds their own `busy_lock`), else under `async with requester.busy_lock`. Stops (leaves the entry queued) if `_deliver_one` returns `None` (couldn't resolve a bank) |
+| `_deliver_one(requester, order, slot, map_db)` *(async)* | Extracted from `_try_deliver_equipment`'s body. The actual move-unequip-deposit-withdraw-equip sequence for one request; returns the old item's code (`""` if the slot was empty, `None` if no bank could be resolved -- the two are distinguished so the caller knows whether to stop) |
+| `_run_gather_step(character, order)` *(async)* | One gather action + deposit-if-full/if-done; calls `_try_deliver_equipment(order, already_locked=character.name)` on completion (see that param's docstring for why this can't be omitted) |
 | `_craft_batch_size(character, item, crafts_needed)` | Bounds a craft batch by inventory space & available materials (via `engine.scheduler._available_for_craft`) |
-| `_run_craft_step(character, order)` *(async)* | Withdraw → craft batch → deposit, bank-to-workshop-to-bank; same `already_locked=character.name` call on completion as `_run_gather_step` |
+| `_run_craft_step(character, order)` *(async)* | Withdraw → craft batch → deposit, bank-to-workshop-to-bank (own-inventory/bank shortfall lookups via `models.find_quantity`); same `already_locked=character.name` call on completion as `_run_gather_step` |
 
 ---
 
@@ -511,23 +454,21 @@ decouples config I/O from `OrderManager`/`Scheduler`/`Executor` per the
 refactor recommendation ("instead of having the scheduler poll the
 filesystem directly...").
 
-**TODO task 9, done:** `loop()` no longer unconditionally reparses
-`stock_config.json` every ~10x `poll_interval`. It now does a cheap
-`os.stat().st_mtime` check every `MTIME_CHECK_INTERVAL` seconds and only
-emits `events.ConfigChanged` on `engine.bus` when the mtime has genuinely
-moved; `ConfigWatcher.__init__` subscribes `_on_config_changed` to that
-event, and that handler is the one place that does the actual
-reparse-and-refresh work. This is the dependency-free path from the TODO's
-task-9 open decision (no `watchdog` added) — see `events.py`'s status note
-for the full before/after.
+`loop()` does a cheap `os.stat().st_mtime` check every
+`MTIME_CHECK_INTERVAL` seconds and only emits `events.ConfigChanged` on
+`engine.bus` when the mtime has genuinely moved; `ConfigWatcher.__init__`
+subscribes `_on_config_changed` to that event, and that handler is the one
+place that does the actual reparse-and-refresh work. This is the
+dependency-free path (no `watchdog` added) — see `ARCHITECTURE.md` for the
+full rationale.
 
 | Function | Purpose |
 |---|---|
-| `load_stock_rules_from_file(path="stock_config.json")` | Reads a JSON `{item_code: minimum}` object from `path` and REPLACES `engine.stock_rules` with it (additions/edits/removals all picked up on reload); remembers `path` on `self.path`; missing file/bad entries are no-ops/warnings, never a crash; also records the file's current mtime on `self._last_mtime` as the watch-loop baseline (TODO task 9) |
+| `load_stock_rules_from_file(path="stock_config.json")` | Reads a JSON `{item_code: minimum}` object from `path` and REPLACES `engine.stock_rules` with it (additions/edits/removals all picked up on reload); remembers `path` on `self.path`; missing file/bad entries are no-ops/warnings, never a crash; also records the file's current mtime on `self._last_mtime` as the watch-loop baseline |
 | `_get_mtime(path=None)` | Cheap `os.stat().st_mtime` read of `path` (or `self.path`); `None` if no path set or the file doesn't currently exist |
-| `_on_config_changed(event)` | **TODO task 9, reactive.** Subscribed to `ConfigChanged` in `__init__`; does the actual `load_stock_rules_from_file` + `engine.order_manager.refresh_stock_orders()` work in reaction to a real file change |
-| `loop()` *(async)* | **TODO task 9.** Sleeps `MTIME_CHECK_INTERVAL` (2s), then does a cheap `os.stat()` mtime check on `self.path`; emits `ConfigChanged` on `engine.bus` only if the mtime moved since the last check. No-ops (just sleeps) if `load_stock_rules_from_file` was never called (wired into `TaskEngine.run()` alongside the other background loops) |
-| `close()` | **TODO task 12.** Unsubscribes `_on_config_changed` from `engine.bus` (tracked in `self._subscriptions`, set at construction) -- called by `TaskEngine.stop()` |
+| `_on_config_changed(event)` | Subscribed to `ConfigChanged` in `__init__`; does the actual `load_stock_rules_from_file` + `engine.order_manager.refresh_stock_orders()` work in reaction to a real file change |
+| `loop()` *(async)* | Sleeps `MTIME_CHECK_INTERVAL` (2s), then does a cheap `os.stat()` mtime check on `self.path`; emits `ConfigChanged` on `engine.bus` only if the mtime moved since the last check. No-ops (just sleeps) if `load_stock_rules_from_file` was never called (wired into `TaskEngine.run()` alongside the other background loops) |
+| `close()` | Unsubscribes `_on_config_changed` from `engine.bus` (tracked in `self._subscriptions`, set at construction) -- called by `TaskEngine.stop()` |
 
 **`MTIME_CHECK_INTERVAL`** *(class constant, = 2.0 seconds)*: how often
 `loop()` stats `stock_config.json` for a change — much shorter than the old
@@ -546,7 +487,7 @@ Shared by every `*Store`.
 | `get_metadata(key)` / `set_metadata(key, value, conn=None)` | Generic KV metadata table access |
 | `count()` | Row count of `self.table_name` |
 | `get_last_updated(key)` / `set_last_updated(key, timestamp, conn=None)` | TTL timestamp helpers |
-| `is_cache_expired(last_updated_key)` | Empty table or TTL exceeded -- **TODO task 11, audited, left as-is.** Deliberately still time-based, not event-driven; see the function's own docstring and the "Change local DB caching/TTL" quick-index row below for why |
+| `is_cache_expired(last_updated_key)` | Empty table or TTL exceeded. Deliberately still time-based, not event-driven -- see `ARCHITECTURE.md` and the "Change local DB caching/TTL" quick-index row below for why |
 | `__getstate__` / `__setstate__` | Pickle safety (nulls `api`) |
 
 ---
@@ -608,7 +549,7 @@ Persists in-progress `GearPlan` tasks (not TTL-cached).
 
 ---
 
-## `tests/test_events.py` — event-driven conversion smoke test (TODO task 13)
+## `tests/test_events.py` — event-driven conversion smoke test
 No test framework in this project (no pytest/unittest infra) -- this is a
 plain `asyncio` script, run directly via `python3 tests/test_events.py`. It
 constructs the REAL `Scheduler`/`Executor`/`OrderManager`/`ConfigWatcher`
@@ -624,10 +565,10 @@ mechanics each test doesn't care about are stubbed out per-test.
 | `FakeEngine` | Minimal duck-typed `TaskEngine` stand-in -- see module docstring |
 | `gather_emitted(bus, event)` | `await`s every task `EventBus.emit()` schedules (fire-and-forget, see `events.py`) so a test can assert on handler side effects immediately rather than racing them |
 | `check(label, cond)` | Tiny assert-and-print helper (`[PASS]`/`[FAIL]`) since there's no test framework to report results |
-| `test_scheduler_wakeups()` | TODO task 5 check: `OrderCreated` wakes only the eligible character's `work_available` (not an ineligible one); a timed idle-wait (mirroring `character_loop`'s) resolves promptly on `OrderReleased`, well under the `IDLE_WAIT_FALLBACK_MULTIPLIER` fallback timeout, proving the event path -- not the fallback -- is what woke it |
-| `test_executor_reactive_delivery()` | TODO task 7 check: `EquipmentRequested`/`BankSynced` trigger `_try_deliver_equipment` (mocked to isolate the reactive wiring from real bank/API mechanics) only for orders that actually have pending `equip_requests`; an unknown `order_id` or a request-free order triggers nothing |
-| `test_order_manager_reactive()` | TODO tasks 8 & 10 check: `OrderCompleted` narrows auto-convert to just the completed code (`_maybe_auto_convert`), `BankSynced` runs the bounded sweep (`refresh_auto_convert_orders`); `_check_stock_thresholds` (real) emits `StockBelowMinimum` only for stock rules currently under their floor, and `_on_stock_below_minimum` narrows to `_maybe_queue_stock_order` per code -- a rule at/above its floor emits nothing |
-| `test_config_watcher_reactive()` | TODO task 9 check: a real temporary `stock_config.json`, edited mid-test, propagates via a real `os.stat().st_mtime` diff (`ConfigWatcher.MTIME_CHECK_INTERVAL` shortened for the test) into `ConfigChanged` -> reload + `refresh_stock_orders()`, with no reaction while the file is unchanged and no old-style timer-driven reparse |
+| `test_scheduler_wakeups()` | Scheduler wakeup check: `OrderCreated` wakes only the eligible character's `work_available` (not an ineligible one); a timed idle-wait (mirroring `character_loop`'s) resolves promptly on `OrderReleased`, well under the `IDLE_WAIT_FALLBACK_MULTIPLIER` fallback timeout, proving the event path -- not the fallback -- is what woke it |
+| `test_executor_reactive_delivery()` | Executor delivery check: `EquipmentRequested`/`BankSynced` trigger `_try_deliver_equipment` (mocked to isolate the reactive wiring from real bank/API mechanics) only for orders that actually have pending `equip_requests`; an unknown `order_id` or a request-free order triggers nothing |
+| `test_order_manager_reactive()` | OrderManager reactive check: `OrderCompleted` narrows auto-convert to just the completed code (`_maybe_auto_convert`), `BankSynced` runs the bounded sweep (`refresh_auto_convert_orders`); `_check_stock_thresholds` (real) emits `StockBelowMinimum` only for stock rules currently under their floor, and `_on_stock_below_minimum` narrows to `_maybe_queue_stock_order` per code -- a rule at/above its floor emits nothing |
+| `test_config_watcher_reactive()` | ConfigWatcher reload check: a real temporary `stock_config.json`, edited mid-test, propagates via a real `os.stat().st_mtime` diff (`ConfigWatcher.MTIME_CHECK_INTERVAL` shortened for the test) into `ConfigChanged` -> reload + `refresh_stock_orders()`, with no reaction while the file is unchanged and no old-style timer-driven reparse |
 | `main()` | Runs all four tests in sequence; any `check()` failure raises `AssertionError` and stops the script |
 
 > Verified passing repeatably (no flakiness across repeated runs) in a
@@ -640,9 +581,9 @@ mechanics each test doesn't care about are stubbed out per-test.
 | I want to... | Look in |
 |---|---|
 | Add/change a raw API call | `client.py` |
-| Change what happens after an action (state sync) | `CharacterActions.py` (`sync_character_state`) |
-| Change movement/pathfinding | `database/map_store.py` (`get_shortest_path`, `find_closest`), `CharacterActions.smart_move` |
-| Change equip/unequip payload shape | `CharacterActions.equip` / `.unequip` |
+| Change what happens after an action (state sync) | `character.py` (`sync_character_state`) |
+| Change movement/pathfinding | `database/map_store.py` (`get_shortest_path`, `find_closest`), `Character.smart_move` |
+| Change equip/unequip payload shape | `Character.equip` / `.unequip` |
 | Change scheduling/priority logic (who gets what order) | `scheduler.py` (`Scheduler.select_order_for`, `_score`, `character_eligible`); tier ordering itself lives in `orders.py` (`Priority` enum, `INERTIA_BONUS`) |
 | Change how a claimed order is actually carried out (gather/craft mechanics) | `executor.py` (`Executor._run_gather_step`, `_run_craft_step`, `_craft_batch_size`) |
 | Change single-use raw-material auto-conversion (e.g. copper_ore → copper_bar) | `order_manager.py` (`OrderManager._maybe_auto_convert`, `refresh_auto_convert_orders`, `_build_single_use_conversions`, reactive subscribers `_on_order_completed`/`_on_bank_synced`); safety-sweep backstop in `task_runner.py` (`TaskEngine._auto_convert_safety_sweep_loop`); tier value in `orders.py` (`Priority.AUTO_CRAFT`) |
@@ -651,7 +592,7 @@ mechanics each test doesn't care about are stubbed out per-test.
 | Change craft/gather order expansion | `order_manager.py` (`OrderManager.request_item`) or `planning.py` (`GearList.resolve`) |
 | Change character naming/roles | `roles.py` |
 | Change rate-limit handling | `account.py` (`RateLimiter`, `classify_bucket`) |
-| Change local DB caching/TTL | `database/base_store.py` (`is_cache_expired`) + the relevant `*_store.py` (`sync_from_api`). **TODO task 11 audit decision: intentionally left time-based, not converted to event-driven.** This TTL cache (default 24h, checked once at startup via `GameDatabase.sync_all()` in `main.py`) guards the *static game-content catalogs* (items/monsters/resources/maps) -- data that changes only when the game itself patches, unlike the four polling sites this TODO converts (character idling, order delivery, auto-convert, stock-config reload), which were re-deriving live *engine* state that changes every tick. No domain event on `engine.bus` plausibly means "the item catalog changed upstream," so there's nothing to subscribe to; see the docstring on `is_cache_expired` for the full reasoning |
+| Change local DB caching/TTL | `database/base_store.py` (`is_cache_expired`) + the relevant `*_store.py` (`sync_from_api`). Intentionally left time-based, not converted to event-driven (see `ARCHITECTURE.md`). This TTL cache (default 24h, checked once at startup via `GameDatabase.sync_all()` in `main.py`) guards the *static game-content catalogs* (items/monsters/resources/maps) -- data that changes only when the game itself patches, unlike engine state that changes every tick. No domain event on `engine.bus` plausibly means "the item catalog changed upstream," so there's nothing to subscribe to; see the docstring on `is_cache_expired` for the full reasoning |
 | Set/tune keep-in-stock minimums per item | `stock_config.json` (project root, `{item_code: minimum}`) -- edit and save; picked up within `ConfigWatcher.MTIME_CHECK_INTERVAL` (2s) via an `os.stat().st_mtime` diff that emits `events.ConfigChanged`, no restart needed; loader is `config_watcher.py` (`ConfigWatcher.load_stock_rules_from_file`, triggered reactively by `ConfigWatcher._on_config_changed`); a rule's shortfall is also now caught reactively as inventory/bank state changes (deposits, gathers/crafts completing), not just on reload -- see `order_manager.py` (`OrderManager._check_stock_thresholds`, `_on_stock_below_minimum`, `_maybe_queue_stock_order`) |
 | Change bank/pending-item sync | `account.py` (`Account.sync_bank`, `.sync_pending_items`) |
 | Add a shared field/behavior across live `WorkOrder`s and persisted `PlanTask`s | `orders.py` (`SchedulableOrder` protocol) — read its docstring first re: why they aren't one class |

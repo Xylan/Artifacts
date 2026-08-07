@@ -308,7 +308,7 @@ class PlanRunner:
         return total
 
     async def _deposit_and_sync(self, character) -> None:
-        await character.actions.deposit_all()
+        await character.deposit_all()
         await self.account.sync_bank()
 
     async def _withdraw_for_craft(self, character, task: PlanTask, crafts_needed: int) -> None:
@@ -333,7 +333,7 @@ class PlanRunner:
                 to_withdraw.append({"code": ing["code"], "quantity": withdraw_qty})
 
         if to_withdraw:
-            await character.actions.withdraw_items(to_withdraw)
+            await character.withdraw_items(to_withdraw)
             await self.account.sync_bank()
 
     async def run(self, plan: GearPlan) -> None:
@@ -368,7 +368,7 @@ class PlanRunner:
                 while self._held(task.code) < task.target_quantity:
                     print(f"[{character.name}] Gathering {task.node_code} for {task.code} "
                           f"({self._held(task.code)}/{task.target_quantity})...")
-                    await character.actions.gather(resource=task.node_code)
+                    await character.gather(resource=task.node_code)
                     if character.is_inventory_full:
                         await self._deposit_and_sync(character)
                 await self._deposit_and_sync(character)  # flush whatever's left
@@ -381,7 +381,7 @@ class PlanRunner:
 
                     print(f"[{character.name}] Crafting {task.code} "
                           f"({self._held(task.code)}/{task.target_quantity})...")
-                    await character.actions.craft(task.code, workshop=task.skill)
+                    await character.craft(task.code, workshop=task.skill)
 
                     if character.is_inventory_full:
                         await self._deposit_and_sync(character)
@@ -407,5 +407,5 @@ class PlanRunner:
     async def deposit_all(self) -> None:
         """Tells every character on the account to deposit their full
         inventory into the bank, concurrently, then refreshes bank state."""
-        await asyncio.gather(*(c.actions.deposit_all() for c in self.characters.values()))
+        await asyncio.gather(*(c.deposit_all() for c in self.characters.values()))
         await self.account.sync_bank()

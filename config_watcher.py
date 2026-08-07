@@ -3,29 +3,19 @@
 """
 config_watcher.py: Decouples file-backed configuration from the scheduler.
 
-Split out of task_runner.py (formerly a "God module"), per the refactor
-recommendation to stop having the scheduler poll the filesystem directly.
 This module owns reading stock_config.json (a JSON object of
 {item_code: minimum_quantity} pairs) and pushing the result into shared
 state (engine.stock_rules) plus nudging OrderManager to act on any change
 (refresh_stock_orders()) -- so editing the file takes effect without a
 restart, without OrderManager/Scheduler/Executor ever touching the
-filesystem themselves.
+filesystem themselves. Config I/O lives here and ONLY here.
 
-TODO task 9: `loop()` used to unconditionally re-read and re-parse the
-whole file every ~10x poll_interval, whether or not it had actually
-changed. It now does a cheap `os.stat().st_mtime` diff on a much shorter
-interval (MTIME_CHECK_INTERVAL) -- stat() only touches inode metadata, so
-this can run far more often than a full JSON-parse-and-rebuild ever
-justified -- and only emits `ConfigChanged` (which `_on_config_changed`
-reacts to by actually reloading + calling refresh_stock_orders()) when the
-mtime has genuinely moved since the last check. This is the
-dependency-free path from the TODO's task-9 open decision (no `watchdog`);
-see the open-decision note in TODO for the tradeoff against a real
-filesystem-notification API.
-
-The important boundary from before is preserved either way: config I/O
-lives here and ONLY here.
+`loop()` does a cheap `os.stat().st_mtime` diff every MTIME_CHECK_INTERVAL
+seconds (inode metadata only, no file content read) and emits
+`ConfigChanged` only when the mtime has genuinely moved; `_on_config_changed`
+reacts to that by actually reloading and calling refresh_stock_orders().
+See ARCHITECTURE.md for why this mtime-diff design replaced unconditional
+timer-based reparsing, and why no filesystem-notification library was added.
 """
 from __future__ import annotations
 
@@ -45,10 +35,9 @@ class ConfigWatcher:
     """Operates on TaskEngine's shared stock_rules list. See module
     docstring."""
 
-    # How often loop() checks stock_config.json's mtime (TODO task 9).
-    # os.stat() is a pure inode-metadata read -- no file content is read
-    # unless the mtime has actually changed -- so this can be far shorter
-    # than the old ~10x-poll_interval full-reparse cadence without adding
+    # How often loop() checks stock_config.json's mtime. os.stat() is a
+    # pure inode-metadata read -- no file content is read unless the mtime
+    # has actually changed -- so this can run fairly often without adding
     # meaningful filesystem load.
     MTIME_CHECK_INTERVAL = 2.0
 
@@ -58,30 +47,23 @@ class ConfigWatcher:
         # remembered so the watch loop can keep checking the same file
         # without the caller having to pass the path twice.
         self.path: Optional[str] = None
-        # mtime baseline for the mtime-diff watch (TODO task 9) -- set
-        # whenever load_stock_rules_from_file() runs (initial load counts as
-        # the baseline, so the first successful load never spuriously fires
-        # a redundant ConfigChanged) and updated again each time the loop
+        # mtime baseline for the mtime-diff watch -- set whenever
+        # load_stock_rules_from_file() runs (initial load counts as the
+        # baseline, so the first successful load never spuriously fires a
+        # redundant ConfigChanged) and updated again each time the loop
         # detects a real change.
         self._last_mtime: Optional[float] = None
 
-        # Reactive reload (TODO task 9), mirroring the subscribe-in-__init__
-        # pattern used by Scheduler/Executor/OrderManager: loop() only
-        # detects the change and emits; this handler does the actual
-        # reparse-and-push-to-OrderManager work, so it's the one place that
-        # logic lives regardless of whether it was triggered by the watch
-        # loop or (in principle) any other future ConfigChanged emitter.
-        #
-        # Subscriptions are tracked in self._subscriptions (TODO task 12) so
-        # close() can unsubscribe them all -- see that method.
+        # loop() only detects the change and emits; this handler does the
+        # actual reparse-and-push-to-OrderManager work. Tracked in
+        # self._subscriptions so close() can unsubscribe them all.
         self._subscriptions = [
             (ConfigChanged, self.engine.bus.subscribe(ConfigChanged, self._on_config_changed)),
         ]
 
     def close(self) -> None:
         """Unsubscribes every handler this instance registered on
-        engine.bus (TODO task 12: subscriber cleanup on TaskEngine.stop()).
-        Idempotent -- see Executor.close()'s matching docstring."""
+        engine.bus. Idempotent -- called by TaskEngine.stop()."""
         for event_type, handler in self._subscriptions:
             self.engine.bus.unsubscribe(event_type, handler)
 
@@ -104,10 +86,10 @@ class ConfigWatcher:
         scheduler over a typo in a hand-edited file.
 
         Also records the file's current mtime as the watch-loop baseline
-        (TODO task 9) -- whether the file exists or not (None if missing),
-        so a first-time reload never fires a spurious ConfigChanged, and a
-        config file that didn't exist yet but appears later is still picked
-        up (mtime goes from None to a real value, which counts as "changed").
+        (None if missing), so a first-time reload never fires a spurious
+        ConfigChanged, and a config file that didn't exist yet but appears
+        later is still picked up (mtime goes from None to a real value,
+        which counts as "changed").
         """
         self.path = path
         p = Path(path)
@@ -155,35 +137,24 @@ class ConfigWatcher:
         return p.stat().st_mtime
 
     def _on_config_changed(self, event: ConfigChanged) -> None:
-        """Reactive handler for ConfigChanged (TODO task 9), subscribed in
-        __init__ -- does the actual reparse-and-push-to-OrderManager work
-        that loop() used to run unconditionally on every tick. loop() only
-        detects that the mtime moved and emits; this is the one place that
-        turns "the file changed" into "stock_rules is up to date and any
-        newly-below-minimum item has an order queued." Any exception here is
-        caught and logged by EventBus._run_handler rather than raised here
-        directly, mirroring every other bus subscriber in the project (none
-        of Scheduler's/Executor's/OrderManager's _on_* handlers self-guard
-        either)."""
+        """Reactive handler for ConfigChanged, subscribed in __init__.
+        loop() only detects that the mtime moved and emits; this is the one
+        place that turns "the file changed" into "stock_rules is up to date
+        and any newly-below-minimum item has an order queued." Any
+        exception here is caught and logged by EventBus._run_handler rather
+        than raised here directly, like every other bus subscriber."""
         self.load_stock_rules_from_file(event.path)
         self.engine.order_manager.refresh_stock_orders()
 
     async def loop(self) -> None:
-        """TODO task 9: replaces the old "unconditionally re-read and
-        re-parse the whole file every ~10x poll_interval" design with a
-        real change signal. Checks self.path's mtime every
-        MTIME_CHECK_INTERVAL seconds (a pure os.stat() call -- no file
-        content is read here) and, only when it has genuinely moved since
-        the last check, emits ConfigChanged on engine.bus -- _on_config_changed
-        above does the actual reload + refresh_stock_orders() in reaction.
-        This means an edit to stock_config.json now takes effect within
-        ~MTIME_CHECK_INTERVAL seconds instead of up to the old
-        ~10x-poll_interval reload cadence, while the file is only ever
-        actually re-parsed when it's truly changed rather than on every
-        tick regardless. No-ops (just sleeps) if load_stock_rules_from_file
-        was never called, so it's harmless to always include this loop in
-        TaskEngine.run() regardless of whether file-backed stock rules are
-        in use."""
+        """Checks self.path's mtime every MTIME_CHECK_INTERVAL seconds (a
+        pure os.stat() call -- no file content is read here) and, only when
+        it has genuinely moved since the last check, emits ConfigChanged on
+        engine.bus -- _on_config_changed above does the actual reload +
+        refresh_stock_orders() in reaction. No-ops (just sleeps) if
+        load_stock_rules_from_file was never called, so it's harmless to
+        always include this loop in TaskEngine.run() regardless of whether
+        file-backed stock rules are in use."""
         engine = self.engine
         while engine.running:
             await asyncio.sleep(self.MTIME_CHECK_INTERVAL)

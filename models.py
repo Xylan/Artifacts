@@ -10,7 +10,14 @@ import character.py just for InventoryItem.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
+
+
+def find_quantity(items: Iterable[Any], code: str) -> int:
+    """Returns the `.quantity` of the first item in `items` whose `.code`
+    matches, or 0 if none does. `items` is typically a bank/inventory list
+    of InventoryItem (or similarly-shaped) objects."""
+    return next((i.quantity for i in items if i.code == code), 0)
 
 
 def parse_reset(value: Any) -> Optional[datetime]:

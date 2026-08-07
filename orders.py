@@ -119,26 +119,21 @@ class WorkOrder:
     # once available. Supports multiple recipients wanting the same item:
     # 5 characters all needing a copper_boots upgrade collapse into ONE
     # order (target_quantity=5) with 5 queued equip_requests, rather than
-    # each getting their own duplicate order. This used to be a single
-    # requester/equip_slot pair, which meant only the FIRST character to
-    # request an item ever got it delivered -- everyone else's share just
-    # sat in the bank forever once the order was marked done. See
-    # TaskEngine._try_deliver_equipment / _delivery_loop.
+    # each getting their own duplicate order. See
+    # executor.Executor._try_deliver_equipment.
     equip_requests: List[Tuple[str, str]] = field(default_factory=list)
     only_for: Optional[str] = None        # restricts claimability to a single character (default tasks)
     locked_to: Optional[str] = None       # CRAFT only: character holding the exclusive claim
     claimed_by: Set[str] = field(default_factory=set)   # GATHER: characters currently working it
     done: bool = False
-    # Non-blocking re-entrancy guard for executor.Executor._try_deliver_equipment
-    # (TODO task 12): delivery can now be reached concurrently from several
-    # independent triggers for the SAME order (EquipmentRequested/BankSynced
-    # bus subscribers, the safety-sweep loop, AND a direct call from
-    # _run_gather_step/_run_craft_step) -- this flag serializes actual work
-    # on the order's equip_requests queue to at most one caller at a time.
-    # Deliberately a plain bool, not an asyncio.Lock: a losing concurrent
-    # call is meant to return immediately rather than block, since blocking
-    # here can deadlock against a character's busy_lock -- see
-    # Executor._try_deliver_equipment's docstring for the full reasoning.
+    # Non-blocking re-entrancy guard for executor.Executor._try_deliver_equipment:
+    # delivery can be reached concurrently from several independent triggers
+    # for the SAME order (bus subscribers, the safety-sweep loop, and a
+    # direct call from _run_gather_step/_run_craft_step), so this flag
+    # serializes actual work on the order's equip_requests queue to at most
+    # one caller at a time. Deliberately a plain bool, not an asyncio.Lock --
+    # see ARCHITECTURE.md's concurrency-audit section for why blocking here
+    # would deadlock.
     _delivering: bool = field(default=False, repr=False)
 
     @property

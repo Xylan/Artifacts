@@ -4,9 +4,8 @@
 scheduler.py: Matches eligible characters to open orders, and drives the
 per-character loop.
 
-Split out of task_runner.py (formerly a "God module"): this file answers
-"who is allowed to work this order, how good a fit are they, and which
-order should this character be doing right now" -- character_eligible,
+Answers "who is allowed to work this order, how good a fit are they, and
+which order should this character be doing right now" -- character_eligible,
 _score, select_order_for -- plus the claim/release/complete lifecycle that
 keeps WorkOrder.locked_to/claimed_by trustworthy, and character_loop, the
 actual infinite per-character coroutine that ties select -> switch -> act
@@ -15,7 +14,8 @@ together.
 It deliberately does NOT contain the mechanics of *how* a gather or craft
 action is carried out (that's executor.py) or how orders are created/sized
 (that's order_manager.py) -- see task_runner.py's module docstring for the
-full boundary description.
+full boundary description. See ARCHITECTURE.md for the design history
+behind the module split and the event-driven idle-wakeup design below.
 """
 from __future__ import annotations
 
@@ -35,27 +35,19 @@ class Scheduler:
     module docstring."""
 
     # Safety-net multiplier on engine.poll_interval for character_loop's
-    # idle wait (TODO task 5): the event-driven wakeups below (see
-    # _on_order_created/_on_order_updated/_on_order_released/
-    # _on_order_completed) are expected to catch essentially every real
-    # case, so this exists only to bound how long a missed/mis-targeted
-    # wakeup can strand an idle character -- deliberately much longer than
-    # the old unconditional poll_interval sleep, since it's a fallback, not
-    # the primary wake mechanism anymore.
+    # idle wait: bounds how long a missed/mis-targeted wakeup can strand an
+    # idle character. The event-driven wakeups below (_on_order_created/
+    # _on_order_updated/_on_order_released/_on_order_completed) are the
+    # primary wake path; this is only the fallback.
     IDLE_WAIT_FALLBACK_MULTIPLIER = 10
 
     def __init__(self, engine: "TaskEngine"):
         self.engine = engine
 
-        # Event-driven idle wakeups (TODO task 5): subscribe once at
-        # construction time (engine.bus already exists by the time
-        # Scheduler(engine) runs -- see TaskEngine.__init__) so every
-        # order-pool change that could plausibly free up work for an idle
-        # character reaches character_loop's wait() below without it having
-        # to poll for that on a timer.
-        #
-        # Subscriptions are tracked in self._subscriptions (TODO task 12) so
-        # close() can unsubscribe them all -- see that method.
+        # Subscribe at construction time so every order-pool change that
+        # could plausibly free up work for an idle character reaches
+        # character_loop's wait() below. Tracked in self._subscriptions so
+        # close() can unsubscribe them all.
         self._subscriptions = [
             (OrderCreated, self.engine.bus.subscribe(OrderCreated, self._on_order_created)),
             (OrderUpdated, self.engine.bus.subscribe(OrderUpdated, self._on_order_updated)),
@@ -65,8 +57,7 @@ class Scheduler:
 
     def close(self) -> None:
         """Unsubscribes every handler this instance registered on
-        engine.bus (TODO task 12: subscriber cleanup on TaskEngine.stop()).
-        Idempotent -- see Executor.close()'s matching docstring."""
+        engine.bus. Idempotent -- called by TaskEngine.stop()."""
         for event_type, handler in self._subscriptions:
             self.engine.bus.unsubscribe(event_type, handler)
 
@@ -144,14 +135,11 @@ class Scheduler:
 
         best, best_score = None, float("-inf")
 
-        # Inertia only applies while `current` is still actually workable --
-        # previously this branch skipped the target/materials checks applied
-        # to every other order below, so once a craft order's ingredients ran
-        # dry the character stayed locked onto it via inertia forever
-        # (character_eligible alone doesn't catch that; it only checks
-        # skill level / lock ownership, not live material stock). That was
-        # why crafting characters got stuck spinning on one dead order
-        # instead of falling through to other craftable/gatherable work.
+        # Inertia only applies while `current` is still actually workable:
+        # character_eligible alone only checks skill level/lock ownership,
+        # not live material stock, so a craft order whose ingredients have
+        # run dry needs this extra check too or the character would stay
+        # locked onto it via inertia with nothing to actually do.
         current_still_workable = (
             current is not None
             and not current.done
@@ -203,14 +191,13 @@ class Scheduler:
         self.engine.bus.emit(OrderCompleted(order_id=order.id, code=order.code))
 
     # ------------------------------------------------------------------
-    # Event-driven idle wakeups (TODO task 5)
+    # Event-driven idle wakeups
     # ------------------------------------------------------------------
-    # These subscribers turn character_loop's idle branch from a blind
-    # poll_interval sleep into a targeted wakeup: whenever the order pool
-    # changes in a way that could plausibly give an idle character
-    # something to do, the relevant character(s)' work_available Event gets
-    # set(), and character_loop's `await character.work_available.wait()`
-    # returns immediately instead of waiting out the fallback timeout.
+    # Whenever the order pool changes in a way that could plausibly give an
+    # idle character something to do, these subscribers set() the relevant
+    # character(s)' work_available Event, so character_loop's
+    # `await character.work_available.wait()` returns immediately instead
+    # of waiting out the fallback timeout.
 
     def _wake_eligible(self, order: WorkOrder) -> None:
         """Sets work_available for every roster character currently
@@ -264,10 +251,9 @@ class Scheduler:
 
             # Holds busy_lock for the whole switch+act cycle so that a
             # concurrent _try_deliver_equipment() call targeting this same
-            # character (from _delivery_loop, a separate task) can't
-            # interleave its own moves in between this loop's move-then-act
-            # steps. See Character.busy_lock for why this can't just reuse
-            # action_lock.
+            # character (from a separate task) can't interleave its own
+            # moves in between this loop's move-then-act steps. See
+            # Character.busy_lock for why this can't just reuse action_lock.
             async with character.busy_lock:
                 await engine.executor._switch_task(character, order)
 
@@ -285,18 +271,13 @@ class Scheduler:
                         do_sleep = True
 
             if do_sleep:
-                # Event-driven idle wait (TODO task 5), replacing the old
-                # unconditional `asyncio.sleep(engine.poll_interval)`. The
-                # Scheduler subscribers above (_on_order_created/_updated/
-                # _released/_completed) set() this character's
-                # work_available whenever the order pool changes in a way
-                # that could plausibly give them something to do, so this
-                # normally returns as soon as real work appears rather than
-                # on the next poll tick. `wait_for`'s timeout is a generous
-                # fallback safety net (not the primary wake path) against a
-                # missed or mis-targeted wakeup -- e.g. some future order
-                # mutation that doesn't yet emit an event/wake the right
-                # characters -- so a character can never get stranded idle
+                # Waits on work_available instead of unconditionally
+                # sleeping poll_interval. The Scheduler subscribers above
+                # set() this character's work_available whenever the order
+                # pool changes in a way that could give them something to
+                # do, so this normally returns as soon as real work appears.
+                # `wait_for`'s timeout is a fallback against a missed or
+                # mis-targeted wakeup, so a character is never stranded idle
                 # forever, only delayed up to the fallback window.
                 try:
                     await asyncio.wait_for(

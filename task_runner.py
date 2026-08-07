@@ -2,17 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 task_runner.py: Dynamic, priority-interrupt task scheduler for the character
-roster -- now a thin orchestrator (TaskEngine) over four categorized
-collaborator modules, rather than the God module this used to be.
+roster. TaskEngine is a thin orchestrator over four collaborator modules;
+see ARCHITECTURE.md for why it's split this way and how the event-bus
+wiring works.
 
 This is the *live* driver of the roster, complementary to planning.py rather
-than a replacement for it: planning.GearPlan/PlanRunner still resolve a
-one-off wishlist into a static DAG and run it to completion. TaskEngine
-instead owns a shared pool of WorkOrders (orders.py) that is continuously
-updated -- orders get created (request_item), reprioritized, locked/
-released, and completed while characters are already mid-run -- and every
-character repeatedly asks "what's the best thing I could be doing right
-now?" at well-defined breakpoints.
+than a replacement for it: planning.GearPlan/PlanRunner resolve a one-off
+wishlist into a static DAG and run it to completion, while TaskEngine owns a
+continuously-updated shared pool of WorkOrders (orders.py) -- orders get
+created (request_item), reprioritized, locked/released, and completed while
+characters are already mid-run -- and every character repeatedly asks
+"what's the best thing I could be doing right now?" at well-defined
+breakpoints.
 
 Module boundary (see function_map.md for the full index):
   * order_manager.py (TaskEngine.order_manager) -- deciding WHAT work
@@ -26,39 +27,35 @@ Module boundary (see function_map.md for the full index):
     step, one craft batch.
   * config_watcher.py (TaskEngine.config_watcher) -- the only module that
     touches the filesystem: reading stock_config.json into shared state and
-    reactively pushing changes to OrderManager the moment the file's mtime
-    actually moves (a cheap periodic os.stat() diff, not a full re-parse on
-    a timer), so nothing else has to poll disk.
+    reactively pushing changes to OrderManager when the file's mtime moves.
 
-TaskEngine itself now only holds the shared state these four collaborators
-operate on (self.orders, self.stock_rules, self.default_orders,
-self._current_order, ...), the handful of trivial state-query helpers used
-by all four (held, _order_for_code, complete), a thin public facade that
+TaskEngine itself holds the shared state these four collaborators operate
+on (self.orders, self.stock_rules, self.default_orders,
+self._current_order, ...), a handful of trivial state-query helpers used by
+all four (held, _order_for_code, complete), a thin public facade that
 forwards to the right collaborator (so external callers like main.py don't
 need to know about the split), and top-level lifecycle (initialize/run/stop
 plus the background loops that tie the collaborators together).
 
 Priority tiers (orders.Priority): EQUIP > CRAFT > GATHER > KEEP_STOCK >
 AUTO_CRAFT > DEFAULT. EQUIP is reserved for equip requests
-(OrderManager.request_equipment) and outranks everything else -- including
-CRAFT plus the inertia bonus below -- so a character waiting on gear
-preempts whatever they're currently doing rather than finishing it first.
-AUTO_CRAFT sits just above DEFAULT busywork: it auto-converts surplus of a
-"pure" single-use default-gathered raw material (one that's only ever an
-ingredient in exactly one recipe, e.g. copper_ore -> copper_bar) into its
-finished item, without ever eating into that raw material's keep-in-stock
-floor -- see OrderManager.refresh_auto_convert_orders(). See
-orders.INERTIA_BONUS for the anti-thrashing bias applied to whatever order a
-character is currently working; DEFAULT-tier orders get none, so they're
-preempted immediately by anything else (zero inertia).
+(OrderManager.request_equipment) and outranks everything else, so a
+character waiting on gear preempts whatever they're currently doing rather
+than finishing it first. AUTO_CRAFT sits just above DEFAULT busywork: it
+auto-converts surplus of a "pure" single-use default-gathered raw material
+(one that's only ever an ingredient in exactly one recipe, e.g.
+copper_ore -> copper_bar) into its finished item, without ever eating into
+that raw material's keep-in-stock floor -- see
+OrderManager.refresh_auto_convert_orders(). See orders.INERTIA_BONUS for
+the anti-thrashing bias applied to whatever order a character is currently
+working; DEFAULT-tier orders get none, so they're preempted immediately by
+anything else.
 
 Breakpoints: a gathering character only re-evaluates for a *different*
 order right after a bank deposit (inventory-full flush, or its target being
 reached) -- never mid gather-action, since a single gather() call is atomic
-and can't be interrupted anyway. A crafting character re-evaluates between
-craft batches for the same reason. This is what satisfies "gathering should
-not be interrupted immediately mid-action; check for new crafting tasks at
-natural breakpoints, such as when the character visits the bank."
+and can't be interrupted. A crafting character re-evaluates between craft
+batches for the same reason.
 """
 from __future__ import annotations
 
@@ -83,18 +80,18 @@ class TaskEngine:
     logic to order_manager.OrderManager / scheduler.Scheduler /
     executor.Executor respectively -- see module docstring above."""
 
-    # Multiplier on poll_interval for _delivery_safety_sweep_loop (TODO
-    # task 7): equipment delivery is now driven reactively by Executor's
-    # EquipmentRequested/BankSynced subscriptions, so this loop is purely a
-    # backstop -- deliberately much less frequent than the old unconditional
-    # per-tick scan, mirroring Scheduler.IDLE_WAIT_FALLBACK_MULTIPLIER's role
-    # as "safety net, not primary mechanism."
+    # Multiplier on poll_interval for _delivery_safety_sweep_loop: equipment
+    # delivery is driven reactively by Executor's EquipmentRequested/
+    # BankSynced subscriptions, so this loop is purely a backstop --
+    # deliberately much less frequent than a per-tick scan, mirroring
+    # Scheduler.IDLE_WAIT_FALLBACK_MULTIPLIER's role as "safety net, not
+    # primary mechanism."
     DELIVERY_SWEEP_MULTIPLIER = 20
 
-    # Same idea for _auto_convert_safety_sweep_loop (TODO task 8):
-    # auto-conversion is now driven reactively by OrderManager's
-    # OrderCompleted/BankSynced subscriptions, so this loop is purely a
-    # backstop against a missed/raced event, not the primary mechanism.
+    # Same idea for _auto_convert_safety_sweep_loop: auto-conversion is
+    # driven reactively by OrderManager's OrderCompleted/BankSynced
+    # subscriptions, so this loop is purely a backstop against a
+    # missed/raced event, not the primary mechanism.
     AUTO_CONVERT_SWEEP_MULTIPLIER = 20
 
     def __init__(
@@ -122,11 +119,11 @@ class TaskEngine:
         # ConfigWatcher. Created before they're instantiated below so it's
         # always available by the time any collaborator's __init__ runs.
         self.bus = EventBus()
-        # Late-bind onto Account too (TODO task 6): Account is constructed
-        # and first synced in main.py BEFORE this engine/bus exist, so it
-        # can't take the bus as a constructor arg -- see Account.__init__'s
-        # comment on self.bus. sync_bank()/sync_pending_items() now emit
-        # BankSynced on whatever bus is set here.
+        # Late-bind onto Account too: Account is constructed and first
+        # synced in main.py before this engine/bus exist, so it can't take
+        # the bus as a constructor arg -- see Account.__init__'s comment on
+        # self.bus. sync_bank()/sync_pending_items() emit BankSynced on
+        # whatever bus is set here.
         self.account.set_bus(self.bus)
 
         # code -> the single Item that consumes it, for every default-gathered
@@ -239,29 +236,19 @@ class TaskEngine:
         an extra trip in the wrong direction."""
         async def _clean_slate(character):
             if not character.is_inventory_empty:
-                await character.actions.deposit_all(return_to_origin=False)
+                await character.deposit_all(return_to_origin=False)
             if character.gold > 0:
-                await character.actions.deposit_gold(character.gold, return_to_origin=False)
+                await character.deposit_gold(character.gold, return_to_origin=False)
 
         await asyncio.gather(*(_clean_slate(c) for c in self.account.characters.values()))
         await self.account.sync_bank()
 
     async def _auto_convert_safety_sweep_loop(self) -> None:
-        """TODO task 8: no longer the primary auto-convert mechanism --
-        that's now OrderManager's OrderCompleted/BankSynced subscriptions
-        (see order_manager.py's OrderManager.__init__), which react
-        immediately to a raw material's supply changing instead of waiting
-        out a poll tick. Kept as a much-lower-frequency belt-and-suspenders
-        backstop (mirroring _delivery_safety_sweep_loop's TODO-task-7
-        tradeoff, applied the same way here) against a conversion that
-        somehow never got triggered reactively -- e.g. an OrderCompleted
-        that fired before an OrderManager subscriber existed, or a
-        BankSynced that raced with a stock-rule edit in the same tick.
-        Calls the same bounded (cached single_use_conversions dict, never
-        the whole order pool) refresh_auto_convert_orders() the reactive
-        path uses, just far less often -- AUTO_CONVERT_SWEEP_MULTIPLIER
-        mirrors DELIVERY_SWEEP_MULTIPLIER/IDLE_WAIT_FALLBACK_MULTIPLIER/
-        ConfigWatcher's ~10x-poll_interval reload cadence."""
+        """Every poll_interval * AUTO_CONVERT_SWEEP_MULTIPLIER seconds, re-runs
+        the bounded refresh_auto_convert_orders() sweep. Auto-conversion is
+        normally driven reactively by OrderManager's OrderCompleted/BankSynced
+        subscriptions; this loop exists only as a backstop in case a reactive
+        event is ever missed. See ARCHITECTURE.md for the full rationale."""
         while self.running:
             await asyncio.sleep(self.poll_interval * self.AUTO_CONVERT_SWEEP_MULTIPLIER)
             try:
@@ -273,22 +260,12 @@ class TaskEngine:
                 print(f"[TaskEngine] Error refreshing auto-convert orders: {e!r}")
 
     async def _delivery_safety_sweep_loop(self) -> None:
-        """TODO task 7: no longer the primary delivery mechanism -- that's
-        now Executor's EquipmentRequested/BankSynced subscriptions (see
-        executor.py's Executor.__init__), which react immediately instead
-        of waiting out a poll tick. This is kept as a much-lower-frequency
-        belt-and-suspenders backstop (per the TODO's task-7 open decision:
-        rather than removing the loop outright) against a delivery that
-        somehow never got triggered reactively -- e.g. an EquipmentRequested
-        that fired before an Executor subscriber existed, or a BankSynced
-        that raced with an order gaining equip_requests in the same tick.
-        Same 'not the whole pool, only orders with something actually
-        queued' scoping as Executor._on_bank_synced, just far less often --
-        DELIVERY_SWEEP_MULTIPLIER mirrors the pattern already used for
-        Scheduler.IDLE_WAIT_FALLBACK_MULTIPLIER and ConfigWatcher's own
-        ~10x-poll_interval reload cadence: a safety net should fire rarely
-        enough that it's obviously not doing the real work, while still
-        bounding how long a missed delivery could go unnoticed."""
+        """Every poll_interval * DELIVERY_SWEEP_MULTIPLIER seconds, re-checks
+        every order with pending equip_requests for a deliverable item.
+        Equipment delivery is normally driven reactively by Executor's
+        EquipmentRequested/BankSynced subscriptions; this loop exists only
+        as a backstop in case a reactive event is ever missed. See
+        ARCHITECTURE.md for the full rationale."""
         while self.running:
             await asyncio.sleep(self.poll_interval * self.DELIVERY_SWEEP_MULTIPLIER)
             for order in list(self.orders.values()):
@@ -318,16 +295,10 @@ class TaskEngine:
         await asyncio.gather(*loops)
 
     def stop(self) -> None:
-        """Stops the run() loops (they all check self.running) and, per the
-        TODO task 12 concurrency audit, unsubscribes every bus handler the
-        four collaborators registered in their own __init__ -- without
-        this, a stopped-then-discarded TaskEngine would leave its
-        Scheduler/Executor/OrderManager/ConfigWatcher instances (and
-        everything they close over) referenced forever by self.bus's
-        internal subscriber lists, and -- more immediately relevant than
-        the leak itself -- a stray late event still in flight when stop()
-        is called would keep calling back into collaborators whose owning
-        engine has already been told to shut down. Each close() is
+        """Stops the run() loops (they all check self.running) and
+        unsubscribes every bus handler the four collaborators registered in
+        their own __init__, via each collaborator's close(). See
+        ARCHITECTURE.md for why this cleanup is needed. Each close() is
         idempotent, so calling stop() more than once is harmless."""
         self.running = False
         self.order_manager.close()
